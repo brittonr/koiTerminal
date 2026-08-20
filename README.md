@@ -27,6 +27,7 @@ Once this repo is in a more presentable state (>=3 distros successfully supporte
 ## Added features<!-- UPDATE -->
 - Boots a user-provided Linux VM image
 - Provides images for other distros (Secureblue, NixOS, Alpine)
+- Forwards declared guest ports without virtiofs or the Terminal guest agent
 - Exposes VM files (configs, storage, etc.) to enable modifying VM configurations
 - Does not force you to give the VM access to all files
 - No rooting necessary, requiring only a one-time permission grant using ADB.
@@ -181,6 +182,33 @@ This method works with the `Block connections without VPN` option and connects d
 Note the VM is still outside the VPN, connected straight to the Internet. <!-- UPDATE -->
 This console uses code from Termux, and inherits some of its features like zooming.
 However, each VM can have only one serial console tab, unlike the multi-tab ttyd.
+
+### Direct port forwarding
+
+A custom image can expose guest TCP ports without the Terminal guest agent or an internal virtiofs share.
+Add a `direct_forwarding` record to `vm_config.json`:
+
+```json
+"direct_forwarding": {
+  "service_type": "_ssh._tcp",
+  "service_name": "onix-ssh",
+  "ports": [2222]
+}
+```
+
+The guest must publish the declared DNS-SD service through mDNS.
+For example, this command publishes the SSH service:
+
+```shell
+avahi-publish-service onix-ssh _ssh._tcp 2222
+```
+
+koiTerminal uses the service address as the guest address.
+It binds each declared port on IPv4 and IPv6 phone loopback.
+Each connection goes to the same port on the guest.
+Only ports from 1024 through 65535 are permitted.
+One image can declare a maximum of 16 ports.
+The listeners stop when the VM stops.
 
 Just like the official Linux Terminal app, if it throws an error, or if it is stuck, try force-stopping and restarting the app, or use the recovery button to wipe and start over.
 

@@ -30,13 +30,12 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.Parcel
-import android.os.Parcelable
 import android.os.ParcelFileDescriptor
+import android.os.Parcelable
 import android.os.ResultReceiver
 import android.os.StatFs
 import android.os.SystemProperties
 import android.system.virtualmachine.VirtualMachine
-import android.system.virtualmachine.VirtualMachineConfig
 import android.system.virtualmachine.VirtualMachineCustomImageConfig
 import android.system.virtualmachine.VirtualMachineCustomImageConfig.AudioConfig
 import android.system.virtualmachine.VirtualMachineException
@@ -58,15 +57,16 @@ import io.grpc.okhttp.OkHttpServerBuilder
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import java.net.Inet4Address
 import java.net.InetSocketAddress
 import java.net.SocketAddress
 import java.nio.file.Files
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
-import com.android.virtualization.koiterminal.SerialIOManager
 
 class VmLauncherService : Service() {
     // Thread pool
@@ -77,27 +77,36 @@ class VmLauncherService : Service() {
 
     // TODO: using lateinit for some fields to avoid null
     private var virtualMachine: VirtualMachine? = null
-    val vm get() = virtualMachine
+    val vm
+        get() = virtualMachine
+
     private var serialSplitter: SerialIOManager? = null
     private var server: Server? = null
     private var debianService: DebianServiceImpl? = null
     private var portNotifier: PortNotifier? = null
+    private var directForwarderHost: DirectForwarderHost? = null
     private var runner: Runner? = null
     private var handler: Handler? = null
+    @Volatile private var destroyed = false
+    private val serviceDiscoveryFutures =
+        ConcurrentHashMap.newKeySet<CompletableFuture<NsdServiceInfo>>()
 
     interface VmLauncherServiceCallback {
         fun onVmStart()
 
         fun onTerminalAvailable(info: TerminalInfo)
 
-        fun onSerialAvailable(outReadingPfd: ParcelFileDescriptor, inWritingPfd: ParcelFileDescriptor)
+        fun onSerialAvailable(
+            outReadingPfd: ParcelFileDescriptor,
+            inWritingPfd: ParcelFileDescriptor,
+        )
 
         fun onVmShuttingDown()
 
         fun onVmStop()
 
         fun onVmError()
-        
+
         fun onTtydTimeout()
     }
 
@@ -219,6 +228,7 @@ class VmLauncherService : Service() {
         val configBuilder = json.toConfigBuilder(this)
         val customImageConfigBuilder = json.toCustomImageConfigBuilder(this)
         val timeout_secs = json.getBootTimeoutSecs() * (if (IS_EMULATOR) 5 else 1)
+        val directForwarding = json.getDirectForwardingConfig()
 
         if (Flags.terminalStorageBalloon()) {
             // When storage ballooning flag is enabled, convert rootfs disk into a sparse file.
@@ -259,6 +269,8 @@ class VmLauncherService : Service() {
             resultReceiver.send(if (success) RESULT_STOP else RESULT_ERROR, null)
             serialSplitter?.flagForShutdown()
             serialSplitter = null
+            directForwarderHost?.stop()
+            directForwarderHost = null
             stopSelf()
         }
         serialSplitter = Logger.setup(this, virtualMachine, bgThreads)
@@ -268,23 +280,71 @@ class VmLauncherService : Service() {
 
         portNotifier = PortNotifier(this)
 
+        directForwarding?.let { forwarding ->
+            getServiceInfo(forwarding.serviceType, forwarding.serviceName, timeout_secs)
+                .thenAcceptAsync(
+                    { info ->
+                        if (destroyed) return@thenAcceptAsync
+                        val guestAddress =
+                            requireNotNull(
+                                (info.hostAddresses.firstOrNull {
+                                        it is Inet4Address && !it.isLinkLocalAddress
+                                    }
+                                        ?: info.hostAddresses.firstOrNull {
+                                            !it.isLinkLocalAddress
+                                        })
+                                    ?.hostAddress
+                            )
+                        directForwarderHost?.stop()
+                        directForwarderHost =
+                            DirectForwarderHost(
+                                    this@VmLauncherService,
+                                    guestAddress,
+                                    forwarding.ports,
+                                )
+                                .also { it.start() }
+                    },
+                    bgThreads,
+                )
+                .exceptionallyAsync(
+                    { error ->
+                        Log.e(TAG, "Direct forwarding service discovery failed", error)
+                        null
+                    },
+                    bgThreads,
+                )
+        }
+
         getTerminalServiceInfo(timeout_secs)
             .thenAcceptAsync(
                 { info ->
+                    if (destroyed) return@thenAcceptAsync
                     // It must exist because it is checked in `getTerminalServiceInfo`
                     Log.i("$TAG-getTerminalServiceInfo()", "thenAcceptAsync")
                     val ipAddress =
                         info.hostAddresses.firstOrNull { !it.isLinkLocalAddress }!!.hostAddress
                     val port = info.port
-                    Log.i("$TAG-getTerminalServiceInfo().thenAcceptAsync", "ip = $ipAddress, port = $port")
+                    Log.i(
+                        "$TAG-getTerminalServiceInfo().thenAcceptAsync",
+                        "ip = $ipAddress, port = $port",
+                    )
                     val bundle = Bundle()
                     bundle.putString(KEY_TERMINAL_IPADDRESS, ipAddress)
                     bundle.putInt(KEY_TERMINAL_PORT, port)
-                    Log.i("$TAG-getTerminalServiceInfo().thenAcceptAsync", "Sending result RESULT_TERMINAL_AVAIL")
+                    Log.i(
+                        "$TAG-getTerminalServiceInfo().thenAcceptAsync",
+                        "Sending result RESULT_TERMINAL_AVAIL",
+                    )
                     resultReceiver.send(RESULT_TERMINAL_AVAIL, bundle)
-                    Log.i("$TAG-getTerminalServiceInfo().thenAcceptAsync", "Running startDebianServer()")
+                    Log.i(
+                        "$TAG-getTerminalServiceInfo().thenAcceptAsync",
+                        "Running startDebianServer()",
+                    )
                     startDebianServer(ipAddress)
-                    Log.i("$TAG-getTerminalServiceInfo().thenAcceptAsync", "Finished running startDebianServer()")
+                    Log.i(
+                        "$TAG-getTerminalServiceInfo().thenAcceptAsync",
+                        "Finished running startDebianServer()",
+                    )
                 },
                 bgThreads,
             )
@@ -293,7 +353,11 @@ class VmLauncherService : Service() {
                     if (e.cause is TimeoutException) {
                         resultReceiver.send(RESULT_TTYD_TIMEOUT, null)
                     } else {
-                        Log.e("$TAG-VmLauncherService", "Failed to start VM, caused by ${e.cause}", e)
+                        Log.e(
+                            "$TAG-VmLauncherService",
+                            "Failed to start VM, caused by ${e.cause}",
+                            e,
+                        )
                         resultReceiver.send(RESULT_ERROR, null)
                         stopSelf()
                     }
@@ -314,20 +378,33 @@ class VmLauncherService : Service() {
     }
 
     private fun getTerminalServiceInfo(timeout_secs: Int): CompletableFuture<NsdServiceInfo> {
-        val executor = Executors.newSingleThreadExecutor(TerminalThreadFactory(applicationContext))
-        val nsdManager = getSystemService<NsdManager?>(NsdManager::class.java)
-        val queryInfo = NsdServiceInfo()
-        queryInfo.serviceType = "_http._tcp"
-        queryInfo.serviceName = "ttyd"
-        var resolvedInfo = CompletableFuture<NsdServiceInfo>()
+        return getServiceInfo("_http._tcp", "ttyd", timeout_secs)
+    }
 
-        nsdManager.registerServiceInfoCallback(
-            queryInfo,
-            executor,
+    private fun getServiceInfo(
+        serviceType: String,
+        serviceName: String,
+        timeout_secs: Int,
+    ): CompletableFuture<NsdServiceInfo> {
+        val executor = Executors.newSingleThreadExecutor(TerminalThreadFactory(applicationContext))
+        val nsdManager = requireNotNull(getSystemService(NsdManager::class.java))
+        val queryInfo = NsdServiceInfo()
+        queryInfo.serviceType = serviceType
+        queryInfo.serviceName = serviceName
+        val resolvedInfo = CompletableFuture<NsdServiceInfo>()
+        serviceDiscoveryFutures.add(resolvedInfo)
+        val callback =
             object : NsdManager.ServiceInfoCallback {
                 var found: Boolean = false
 
-                override fun onServiceInfoCallbackRegistrationFailed(errorCode: Int) {}
+                override fun onServiceInfoCallbackRegistrationFailed(errorCode: Int) {
+                    executor.shutdown()
+                    resolvedInfo.completeExceptionally(
+                        IllegalStateException(
+                            "mDNS callback registration failed for $serviceName with code $errorCode"
+                        )
+                    )
+                }
 
                 override fun onServiceInfoCallbackUnregistered() {
                     executor.shutdown()
@@ -344,17 +421,35 @@ class VmLauncherService : Service() {
                         return
                     }
 
-                    if (!found) {
+                    if (!found && resolvedInfo.complete(info)) {
                         found = true
-                        nsdManager.unregisterServiceInfoCallback(this)
-                        resolvedInfo.complete(info)
+                        try {
+                            nsdManager.unregisterServiceInfoCallback(this)
+                        } catch (_: IllegalArgumentException) {
+                            executor.shutdown()
+                        }
                     }
                 }
-            },
-        )
+            }
+        try {
+            nsdManager.registerServiceInfoCallback(queryInfo, executor, callback)
+        } catch (error: RuntimeException) {
+            executor.shutdown()
+            resolvedInfo.completeExceptionally(error)
+        }
 
         if (timeout_secs > 0) {
             resolvedInfo.orTimeout(timeout_secs.toLong(), TimeUnit.SECONDS)
+        }
+        resolvedInfo.whenComplete { _, error ->
+            serviceDiscoveryFutures.remove(resolvedInfo)
+            if (error != null) {
+                try {
+                    nsdManager.unregisterServiceInfoCallback(callback)
+                } catch (_: IllegalArgumentException) {
+                    executor.shutdown()
+                }
+            }
         }
         return resolvedInfo
     }
@@ -553,6 +648,7 @@ class VmLauncherService : Service() {
     }
 
     override fun onDestroy() {
+        destroyed = true
         handler = null
         mainWorkerThread.execute({
             if (runner?.vm?.getStatus() == VirtualMachine.STATUS_RUNNING) {
@@ -561,6 +657,10 @@ class VmLauncherService : Service() {
             }
         })
         portNotifier?.stop()
+        serviceDiscoveryFutures.forEach { it.cancel(true) }
+        serviceDiscoveryFutures.clear()
+        directForwarderHost?.stop()
+        directForwarderHost = null
         getSystemService<NotificationManager?>(NotificationManager::class.java).cancelAll()
         stopDebianServer()
         bgThreads.shutdownNow()
@@ -613,8 +713,16 @@ class VmLauncherService : Service() {
                         when (resultCode) {
                             RESULT_START -> callback.onVmStart()
                             RESULT_SERIAL_AVAIL -> {
-                                val inWritingPfd = resultData!!.getParcelable(KEY_TERMINAL_INWRITINGPFD, ParcelFileDescriptor::class.java)!!
-                                val outReadingPfd = resultData!!.getParcelable(KEY_TERMINAL_OUTREADINGPFD, ParcelFileDescriptor::class.java)!!
+                                val inWritingPfd =
+                                    resultData!!.getParcelable(
+                                        KEY_TERMINAL_INWRITINGPFD,
+                                        ParcelFileDescriptor::class.java,
+                                    )!!
+                                val outReadingPfd =
+                                    resultData!!.getParcelable(
+                                        KEY_TERMINAL_OUTREADINGPFD,
+                                        ParcelFileDescriptor::class.java,
+                                    )!!
                                 callback.onSerialAvailable(outReadingPfd, inWritingPfd)
                             }
                             RESULT_TERMINAL_AVAIL -> {
@@ -664,7 +772,7 @@ class VmLauncherService : Service() {
             i.setAction(ACTION_SHUTDOWN_VM)
             return i
         }
-        
+
         fun getIntentForQuerySerial(context: Context, callback: VmLauncherServiceCallback): Intent {
             val i = prepareIntent(context, callback)
             i.setAction(ACTION_QUERY_VM_SERIAL)

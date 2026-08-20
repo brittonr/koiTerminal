@@ -21,14 +21,14 @@ use std::collections::btree_map::Entry as BTreeMapEntry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, TcpListener};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::io::AsRawFd;
 use std::result;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use forwarder::forwarder::ForwarderSession;
-use jni::objects::{JIntArray, JObject, JValue};
+use jni::objects::{JIntArray, JObject, JString, JValue};
 use jni::sys::jint;
 use jni::JNIEnv;
 use log::{debug, error, info, warn};
@@ -39,6 +39,8 @@ use vsock::VsockListener;
 use vsock::VMADDR_CID_ANY;
 
 const CHUNNEL_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_FORWARDED_PORTS: usize = 16;
+const MIN_FORWARDED_PORT: u16 = 1024;
 
 const VMADDR_PORT_ANY: u32 = u32::MAX;
 
@@ -50,6 +52,17 @@ static UPDATE_EVT: LazyLock<EventFd> = LazyLock::new(|| {
 });
 
 static UPDATE_QUEUE: LazyLock<Arc<Mutex<VecDeque<u16>>>> =
+    LazyLock::new(|| Arc::new(Mutex::new(VecDeque::new())));
+
+static DIRECT_SHUTDOWN_EVT: LazyLock<EventFd> =
+    LazyLock::new(|| EventFd::new().expect("Could not create direct shutdown eventfd"));
+
+static DIRECT_UPDATE_EVT: LazyLock<EventFd> = LazyLock::new(|| {
+    EventFd::from_flags(EfdFlags::EFD_SEMAPHORE | EfdFlags::EFD_NONBLOCK)
+        .expect("Could not create direct update eventfd")
+});
+
+static DIRECT_UPDATE_QUEUE: LazyLock<Arc<Mutex<VecDeque<u16>>>> =
     LazyLock::new(|| Arc::new(Mutex::new(VecDeque::new())));
 
 #[remain::sorted]
@@ -66,6 +79,7 @@ enum Error {
     PollWait(vmm_sys_util::errno::Error),
     SetVsockNonblocking(io::Error),
     TcpAccept(io::Error),
+    TcpConnect(io::Error),
     TcpListenerPort(io::Error),
     UpdateEventRead(nix::Error),
     VsockAccept(io::Error),
@@ -93,6 +107,7 @@ impl fmt::Display for Error {
             PollWait(e) => write!(f, "failed to wait for poll: {e}"),
             SetVsockNonblocking(e) => write!(f, "failed to set vsock to nonblocking: {e}"),
             TcpAccept(e) => write!(f, "failed to accept tcp: {e}"),
+            TcpConnect(e) => write!(f, "failed to connect to guest tcp: {e}"),
             TcpListenerPort(e) => {
                 write!(f, "failed to read local sockaddr for tcp listener: {e}")
             }
@@ -132,31 +147,60 @@ enum SocketFamily {
     Ipv6,
 }
 
+enum RemoteTarget<'a> {
+    Direct(IpAddr),
+    Vsock { cid: u32, jni_env: JNIEnv<'a>, jni_cb: JObject<'a> },
+}
+
 /// ForwarderSessions encapsulates all forwarding state for chunneld.
 struct ForwarderSessions<'a> {
     listening_ports: BTreeMap<u16, PortListeners>,
     tcp4_forwarders: HashMap<SessionTag, ForwarderSession>,
-    cid: u32,
-    jni_env: JNIEnv<'a>,
-    jni_cb: JObject<'a>,
+    remote_target: RemoteTarget<'a>,
+    shutdown_evt: &'static EventFd,
+    update_evt: &'static EventFd,
+    update_queue: &'static Arc<Mutex<VecDeque<u16>>>,
 }
 
 impl<'a> ForwarderSessions<'a> {
-    /// Creates a new instance of ForwarderSessions.
-    fn new(cid: i32, jni_env: JNIEnv<'a>, jni_cb: JObject<'a>) -> Result<Self> {
-        Ok(ForwarderSessions {
+    fn new_vsock(cid: i32, jni_env: JNIEnv<'a>, jni_cb: JObject<'a>) -> Self {
+        Self::new(
+            RemoteTarget::Vsock { cid: cid as u32, jni_env, jni_cb },
+            &SHUTDOWN_EVT,
+            &UPDATE_EVT,
+            &UPDATE_QUEUE,
+        )
+    }
+
+    fn new_direct(guest_address: IpAddr) -> Self {
+        Self::new(
+            RemoteTarget::Direct(guest_address),
+            &DIRECT_SHUTDOWN_EVT,
+            &DIRECT_UPDATE_EVT,
+            &DIRECT_UPDATE_QUEUE,
+        )
+    }
+
+    fn new(
+        remote_target: RemoteTarget<'a>,
+        shutdown_evt: &'static EventFd,
+        update_evt: &'static EventFd,
+        update_queue: &'static Arc<Mutex<VecDeque<u16>>>,
+    ) -> Self {
+        ForwarderSessions {
             listening_ports: BTreeMap::new(),
             tcp4_forwarders: HashMap::new(),
-            cid: cid as u32,
-            jni_env,
-            jni_cb,
-        })
+            remote_target,
+            shutdown_evt,
+            update_evt,
+            update_queue,
+        }
     }
 
     /// Adds or removes listeners based on the latest listening ports from the D-Bus thread.
     fn process_update_queue(&mut self, poll_ctx: &PollContext<Token>) -> Result<()> {
         // Unwrap of LockResult is customary.
-        let mut update_queue = UPDATE_QUEUE.lock().unwrap();
+        let mut update_queue = self.update_queue.lock().unwrap();
         let mut active_ports: BTreeSet<u16> = BTreeSet::new();
 
         // Add any new listeners first.
@@ -206,7 +250,7 @@ impl<'a> ForwarderSessions<'a> {
         }
 
         // Consume the eventfd.
-        UPDATE_EVT.read().map_err(Error::UpdateEventRead)?;
+        self.update_evt.read().map_err(Error::UpdateEventRead)?;
 
         Ok(())
     }
@@ -228,8 +272,14 @@ impl<'a> ForwarderSessions<'a> {
         // This session should be dropped if any of the PollContext setup fails. Since the only
         // extant fds for the underlying sockets will be closed, they will be unregistered from
         // epoll set automatically.
-        let session =
-            create_forwarder_session(listener, self.cid, &mut self.jni_env, &self.jni_cb)?;
+        let session = match &mut self.remote_target {
+            RemoteTarget::Direct(guest_address) => {
+                create_direct_forwarder_session(listener, *guest_address)?
+            }
+            RemoteTarget::Vsock { cid, jni_env, jni_cb } => {
+                create_vsock_forwarder_session(listener, *cid, jni_env, jni_cb)?
+            }
+        };
 
         let tag = session.local_stream().as_raw_fd() as u32;
 
@@ -277,8 +327,8 @@ impl<'a> ForwarderSessions<'a> {
 
     fn run(&mut self) -> Result<()> {
         let poll_ctx: PollContext<Token> = PollContext::new().map_err(Error::PollContextNew)?;
-        poll_ctx.add(&*UPDATE_EVT, Token::UpdatePorts).map_err(Error::PollContextAdd)?;
-        poll_ctx.add(&*SHUTDOWN_EVT, Token::Shutdown).map_err(Error::PollContextAdd)?;
+        poll_ctx.add(self.update_evt, Token::UpdatePorts).map_err(Error::PollContextAdd)?;
+        poll_ctx.add(self.shutdown_evt, Token::Shutdown).map_err(Error::PollContextAdd)?;
 
         loop {
             let events = poll_ctx.wait().map_err(Error::PollWait)?;
@@ -286,6 +336,7 @@ impl<'a> ForwarderSessions<'a> {
             for event in events.iter_readable() {
                 match event.token() {
                     Token::Shutdown => {
+                        self.shutdown_evt.read().map_err(Error::UpdateEventRead)?;
                         return Ok(());
                     }
                     Token::UpdatePorts => {
@@ -322,7 +373,7 @@ impl<'a> ForwarderSessions<'a> {
 }
 
 /// Creates a forwarder session from a `listener` that has a pending connection to accept.
-fn create_forwarder_session(
+fn create_vsock_forwarder_session(
     listener: &TcpListener,
     cid: u32,
     jni_env: &mut JNIEnv,
@@ -370,14 +421,85 @@ fn create_forwarder_session(
     }
 }
 
+fn create_direct_forwarder_session(
+    listener: &TcpListener,
+    guest_address: IpAddr,
+) -> Result<ForwarderSession> {
+    let (local_stream, _) = listener.accept().map_err(Error::TcpAccept)?;
+    let port = listener.local_addr().map_err(Error::TcpListenerPort)?.port();
+    let remote_address = SocketAddr::new(guest_address, port);
+    let remote_stream = TcpStream::connect_timeout(&remote_address, CHUNNEL_CONNECT_TIMEOUT)
+        .map_err(Error::TcpConnect)?;
+    Ok(ForwarderSession::new(local_stream.into(), remote_stream.into()))
+}
+
 // TODO(b/340126051): Host can receive opened ports from the guest.
 fn run_forwarder_host(cid: i32, jni_env: JNIEnv, jni_cb: JObject) -> Result<()> {
     debug!("Starting forwarder_host");
-    let mut sessions = ForwarderSessions::new(cid, jni_env, jni_cb)?;
+    let mut sessions = ForwarderSessions::new_vsock(cid, jni_env, jni_cb);
     sessions.run()
 }
 
-/// JNI function for running forwarder_host.
+fn run_direct_forwarder_host(guest_address: IpAddr) -> Result<()> {
+    debug!("Starting direct forwarder_host for {guest_address}");
+    let mut sessions = ForwarderSessions::new_direct(guest_address);
+    sessions.run()
+}
+
+fn validate_forwarded_ports(ports: &[i32]) -> result::Result<Vec<u16>, String> {
+    if ports.len() > MAX_FORWARDED_PORTS {
+        return Err(format!("too many forwarded ports: {}", ports.len()));
+    }
+    ports
+        .iter()
+        .map(|port| {
+            let port: u16 =
+                (*port).try_into().map_err(|_| format!("invalid forwarded port: {port}"))?;
+            if port < MIN_FORWARDED_PORT {
+                return Err(format!("privileged forwarded port is not allowed: {port}"));
+            }
+            Ok(port)
+        })
+        .collect()
+}
+
+fn replace_listening_ports(
+    env: &JNIEnv,
+    ports: &JIntArray,
+    update_queue: &Arc<Mutex<VecDeque<u16>>>,
+    update_evt: &EventFd,
+) -> result::Result<(), String> {
+    let length =
+        env.get_array_length(ports).map_err(|e| format!("failed to get port array length: {e}"))?;
+    let mut buf = vec![0; length as usize];
+    env.get_int_array_region(ports, 0, &mut buf)
+        .map_err(|e| format!("failed to get port array: {e}"))?;
+    let ports = validate_forwarded_ports(&buf)?;
+
+    let mut queue = update_queue.lock().unwrap();
+    queue.clear();
+    queue.extend(ports);
+    update_evt.write(1).map(|_| ()).map_err(|e| format!("failed to write update eventfd: {e}"))
+}
+
+fn run_vsock_from_jni(cid: jint, env: JNIEnv, callback: JObject) {
+    // Clear shutdown event FD before running the legacy guest-agent forwarder.
+    SHUTDOWN_EVT.write(1).expect("Failed to write shutdown event FD");
+    SHUTDOWN_EVT.read().expect("Failed to consume shutdown event FD");
+
+    match run_forwarder_host(cid, env, callback) {
+        Ok(_) => info!("forwarder_host is terminated"),
+        Err(e) => error!("Error on forwarder_host: {e:?}"),
+    }
+}
+
+fn update_vsock_ports_from_jni(env: JNIEnv, ports: JIntArray) {
+    if let Err(e) = replace_listening_ports(&env, &ports, &UPDATE_QUEUE, &UPDATE_EVT) {
+        error!("Failed to update forwarder_host ports: {e}");
+    }
+}
+
+/// JNI function for running the legacy guest-agent forwarder.
 #[no_mangle]
 pub extern "C" fn Java_com_android_virtualization_terminal_DebianServiceImpl_runForwarderHost(
     env: JNIEnv,
@@ -385,21 +507,21 @@ pub extern "C" fn Java_com_android_virtualization_terminal_DebianServiceImpl_run
     cid: jint,
     callback: JObject,
 ) {
-    // Clear shutdown event FD before running forwarder host.
-    SHUTDOWN_EVT.write(1).expect("Failed to write shutdown event FD");
-    SHUTDOWN_EVT.read().expect("Failed to consume shutdown event FD");
-
-    match run_forwarder_host(cid, env, callback) {
-        Ok(_) => {
-            info!("forwarder_host is terminated");
-        }
-        Err(e) => {
-            error!("Error on forwarder_host: {e:?}");
-        }
-    }
+    run_vsock_from_jni(cid, env, callback);
 }
 
-/// JNI function for terminating forwarder_host.
+/// Standalone koiTerminal package alias for the legacy guest-agent forwarder.
+#[no_mangle]
+pub extern "C" fn Java_com_android_virtualization_koiterminal_DebianServiceImpl_runForwarderHost(
+    env: JNIEnv,
+    _class: JObject,
+    cid: jint,
+    callback: JObject,
+) {
+    run_vsock_from_jni(cid, env, callback);
+}
+
+/// JNI function for terminating the legacy guest-agent forwarder.
 #[no_mangle]
 pub extern "C" fn Java_com_android_virtualization_terminal_DebianServiceImpl_terminateForwarderHost(
     _env: JNIEnv,
@@ -408,21 +530,118 @@ pub extern "C" fn Java_com_android_virtualization_terminal_DebianServiceImpl_ter
     SHUTDOWN_EVT.write(1).expect("Failed to write shutdown event FD");
 }
 
-/// JNI function for updating listening ports.
+/// Standalone koiTerminal package alias for terminating the guest-agent forwarder.
+#[no_mangle]
+pub extern "C" fn Java_com_android_virtualization_koiterminal_DebianServiceImpl_terminateForwarderHost(
+    _env: JNIEnv,
+    _class: JObject,
+) {
+    SHUTDOWN_EVT.write(1).expect("Failed to write shutdown event FD");
+}
+
+/// JNI function for updating legacy guest-agent forwarding ports.
 #[no_mangle]
 pub extern "C" fn Java_com_android_virtualization_terminal_DebianServiceImpl_updateListeningPorts(
     env: JNIEnv,
     _class: JObject,
     ports: JIntArray,
 ) {
-    let length = env.get_array_length(&ports).expect("Failed to get length of port array");
-    let mut buf = vec![0; length as usize];
-    env.get_int_array_region(ports, 0, &mut buf).expect("Failed to get port array");
+    update_vsock_ports_from_jni(env, ports);
+}
 
-    let mut update_queue = UPDATE_QUEUE.lock().unwrap();
-    update_queue.clear();
-    for port in buf {
-        update_queue.push_back(port.try_into().expect("Failed to add port into update queue"));
+/// Standalone koiTerminal package alias for updating guest-agent forwarding ports.
+#[no_mangle]
+pub extern "C" fn Java_com_android_virtualization_koiterminal_DebianServiceImpl_updateListeningPorts(
+    env: JNIEnv,
+    _class: JObject,
+    ports: JIntArray,
+) {
+    update_vsock_ports_from_jni(env, ports);
+}
+
+/// Runs direct loopback-to-guest TCP forwarding without virtiofs or a guest agent.
+#[no_mangle]
+pub extern "C" fn Java_com_android_virtualization_koiterminal_DirectForwarderHost_run(
+    mut env: JNIEnv,
+    _class: JObject,
+    guest_address: JString,
+    ports: JIntArray,
+) {
+    let guest_address: String = match env.get_string(&guest_address) {
+        Ok(value) => value.into(),
+        Err(e) => {
+            error!("Failed to read direct forwarding guest address: {e}");
+            return;
+        }
+    };
+    let guest_address: IpAddr = match guest_address.parse() {
+        Ok(value) => value,
+        Err(e) => {
+            error!("Invalid direct forwarding guest address: {e}");
+            return;
+        }
+    };
+    // A prior run can stop before it consumes its update event. Drain that stale signal before the
+    // new port set is installed, or the old signal can remove the new listeners after startup.
+    while DIRECT_UPDATE_EVT.read().is_ok() {}
+    if let Err(e) = replace_listening_ports(&env, &ports, &DIRECT_UPDATE_QUEUE, &DIRECT_UPDATE_EVT)
+    {
+        error!("Failed to configure direct forwarding ports: {e}");
+        return;
     }
-    UPDATE_EVT.write(1).expect("failed to write update eventfd");
+
+    match run_direct_forwarder_host(guest_address) {
+        Ok(_) => info!("direct forwarder_host is terminated"),
+        Err(e) => error!("Error on direct forwarder_host: {e:?}"),
+    }
+}
+
+/// Stops direct loopback-to-guest TCP forwarding.
+#[no_mangle]
+pub extern "C" fn Java_com_android_virtualization_koiterminal_DirectForwarderHost_shutdown(
+    _env: JNIEnv,
+    _class: JObject,
+) {
+    DIRECT_SHUTDOWN_EVT.write(1).expect("Failed to write direct shutdown event FD");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    #[test]
+    fn direct_forwarder_connects_to_same_port_on_guest_address() {
+        let host_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = host_listener.local_addr().unwrap().port();
+        let guest_address = Ipv4Addr::new(127, 0, 0, 2);
+        let guest_listener = TcpListener::bind((guest_address, port)).unwrap();
+        let mut local_client = TcpStream::connect(host_listener.local_addr().unwrap()).unwrap();
+
+        let mut session =
+            create_direct_forwarder_session(&host_listener, guest_address.into()).unwrap();
+        let (mut guest_server, _) = guest_listener.accept().unwrap();
+
+        local_client.write_all(b"from-host").unwrap();
+        assert!(!session.forward_from_local().unwrap());
+        let mut from_host = [0_u8; 9];
+        guest_server.read_exact(&mut from_host).unwrap();
+        assert_eq!(&from_host, b"from-host");
+
+        guest_server.write_all(b"from-guest").unwrap();
+        assert!(!session.forward_from_remote().unwrap());
+        let mut from_guest = [0_u8; 10];
+        local_client.read_exact(&mut from_guest).unwrap();
+        assert_eq!(&from_guest, b"from-guest");
+    }
+
+    #[test]
+    fn forwarded_port_validation_is_bounded_and_unprivileged() {
+        assert_eq!(validate_forwarded_ports(&[2222, 65535]).unwrap(), vec![2222, 65535]);
+        assert!(validate_forwarded_ports(&[22]).unwrap_err().contains("privileged"));
+        assert!(validate_forwarded_ports(&[-1]).unwrap_err().contains("invalid"));
+        assert!(validate_forwarded_ports(&[2222; MAX_FORWARDED_PORTS + 1])
+            .unwrap_err()
+            .contains("too many"));
+    }
 }

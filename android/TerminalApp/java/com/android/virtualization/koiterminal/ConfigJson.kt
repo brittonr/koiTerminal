@@ -66,6 +66,7 @@ internal data class ConfigJson(
     private val gpu: GpuJson?,
     private val auto_memory_balloon: Boolean,
     private val boot_timeout_secs: Int?,
+    private val direct_forwarding: DirectForwardingJson? = null,
 ) {
     private fun getCpuTopology(): Int {
         return when (cpu_topology) {
@@ -82,6 +83,17 @@ internal data class ConfigJson(
 
     internal fun getBootTimeoutSecs(): Int {
         return boot_timeout_secs ?: DEFAULT_BOOT_TIMEOUT
+    }
+
+    /**
+     * Returns explicit direct forwarding configuration for custom images.
+     *
+     * This path does not depend on Terminal's internal virtiofs share or guest agent. The guest
+     * address is resolved from the declared mDNS service. Privileged ports are rejected, and the
+     * bound is kept small so image metadata cannot create an unbounded set of host listeners.
+     */
+    internal fun getDirectForwardingConfig(): DirectForwardingConfig? {
+        return direct_forwarding?.toConfig()
     }
 
     /** Converts this parsed JSON into VirtualMachineConfig Builder */

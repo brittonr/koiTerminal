@@ -51,6 +51,15 @@ android_app {
     jarjar_rules: "jarjar-rules.txt",
 }
 
+java_test_host {
+    name: "DirectForwardingConfigTests",
+    srcs: [
+        "java/com/android/virtualization/koiterminal/DirectForwardingConfig.kt",
+        "tests/DirectForwardingConfigTest.kt",
+    ],
+    static_libs: ["junit"],
+}
+
 aidl_interface {
     name: "VmTerminalApp.aidl",
     srcs: ["aidl/**/*.aidl"],

@@ -2,8 +2,8 @@ package {
     default_applicable_licenses: ["Android-Apache-2.0"],
 }
 
-rust_ffi_shared {
-    name: "libforwarder_host_jni",
+rust_defaults {
+    name: "forwarder_host_defaults",
     crate_name: "forwarder_host",
     edition: "2021",
     srcs: ["src/forwarder_host.rs"],
@@ -19,8 +19,19 @@ rust_ffi_shared {
         "libpoll_token_derive",
         "libremain",
     ],
+}
+
+rust_ffi_shared {
+    name: "libforwarder_host_jni",
+    defaults: ["forwarder_host_defaults"],
     apex_available: [
         "com.android.virt",
     ],
     prefer_rlib: true,
+}
+
+rust_test {
+    name: "forwarder_host_test",
+    defaults: ["forwarder_host_defaults"],
+    test_suites: ["general-tests"],
 }
