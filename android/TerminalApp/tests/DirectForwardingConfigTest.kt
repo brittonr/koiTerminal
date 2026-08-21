@@ -15,32 +15,59 @@
  */
 package com.android.virtualization.koiterminal
 
+import com.google.gson.JsonParser
 import org.junit.Assert.assertArrayEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class DirectForwardingConfigTest {
+    private fun record(json: String) = JsonParser.parseString(json).asJsonObject
+
     @Test
     fun validConfigSortsAndDeduplicatesPorts() {
         val config =
-            DirectForwardingJson("_ssh._tcp", "onix-ssh", intArrayOf(2222, 8080, 2222)).toConfig()
+            DirectForwardingConfig.fromJson(
+                record(
+                    """{"service_type":"_ssh._tcp","service_name":"onix-ssh","ports":[2222,8080,2222]}"""
+                )
+            )
 
-        assertArrayEquals(intArrayOf(2222, 8080), config.ports)
+        assertArrayEquals(intArrayOf(2222, 8080), config!!.ports)
+    }
+
+    @Test
+    fun nullRecordYieldsNoForwarding() {
+        assertNull(DirectForwardingConfig.fromJson(null))
     }
 
     @Test
     fun invalidServiceAndPortShapesAreRejected() {
         assertThrows(IllegalArgumentException::class.java) {
-            DirectForwardingJson("ssh", "onix-ssh", intArrayOf(2222)).toConfig()
+            DirectForwardingConfig.fromJson(
+                record("""{"service_type":"ssh","service_name":"onix-ssh","ports":[2222]}""")
+            )
         }
         assertThrows(IllegalArgumentException::class.java) {
-            DirectForwardingJson("_ssh._tcp", "", intArrayOf(2222)).toConfig()
+            DirectForwardingConfig.fromJson(
+                record("""{"service_type":"_ssh._tcp","service_name":"","ports":[2222]}""")
+            )
         }
         assertThrows(IllegalArgumentException::class.java) {
-            DirectForwardingJson("_ssh._tcp", "onix-ssh", intArrayOf(22)).toConfig()
+            DirectForwardingConfig.fromJson(
+                record("""{"service_type":"_ssh._tcp","service_name":"onix-ssh","ports":[22]}""")
+            )
         }
         assertThrows(IllegalArgumentException::class.java) {
-            DirectForwardingJson("_ssh._tcp", "onix-ssh", IntArray(17) { 2222 }).toConfig()
+            DirectForwardingConfig.fromJson(
+                record("""{"service_type":"_ssh._tcp","service_name":"onix-ssh","ports":[]}""")
+            )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            val many = (1..17).joinToString(",") { "2222" }
+            DirectForwardingConfig.fromJson(
+                record("""{"service_type":"_ssh._tcp","service_name":"onix-ssh","ports":[$many]}""")
+            )
         }
     }
 }

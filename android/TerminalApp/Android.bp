@@ -57,7 +57,10 @@ java_test_host {
         "java/com/android/virtualization/koiterminal/DirectForwardingConfig.kt",
         "tests/DirectForwardingConfigTest.kt",
     ],
-    static_libs: ["junit"],
+    static_libs: [
+        "gson",
+        "junit",
+    ],
 }
 
 aidl_interface {

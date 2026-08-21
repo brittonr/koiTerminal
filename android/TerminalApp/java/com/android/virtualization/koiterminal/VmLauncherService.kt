@@ -22,6 +22,8 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.graphics.drawable.Icon
+import android.net.ConnectivityManager
+import android.net.Network
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.os.Build
@@ -386,71 +388,127 @@ class VmLauncherService : Service() {
         serviceName: String,
         timeout_secs: Int,
     ): CompletableFuture<NsdServiceInfo> {
-        val executor = Executors.newSingleThreadExecutor(TerminalThreadFactory(applicationContext))
         val nsdManager = requireNotNull(getSystemService(NsdManager::class.java))
-        val queryInfo = NsdServiceInfo()
-        queryInfo.serviceType = serviceType
-        queryInfo.serviceName = serviceName
         val resolvedInfo = CompletableFuture<NsdServiceInfo>()
         serviceDiscoveryFutures.add(resolvedInfo)
-        val callback =
-            object : NsdManager.ServiceInfoCallback {
-                var found: Boolean = false
 
-                override fun onServiceInfoCallbackRegistrationFailed(errorCode: Int) {
-                    executor.shutdown()
-                    resolvedInfo.completeExceptionally(
-                        IllegalStateException(
-                            "mDNS callback registration failed for $serviceName with code $errorCode"
+        // The default (null-network) query is what reaches a custom image: mdnsd
+        // multicasts it on every interface, including the AVF tap tether. Extra
+        // network-scoped registrations cover setups where the guest network is
+        // a first-class Android network.
+        val connectivityManager = getSystemService(ConnectivityManager::class.java)
+        val targets: MutableList<Network?> =
+            mutableListOf<Network?>(null).apply {
+                connectivityManager?.allNetworks?.forEach { add(it) }
+            }
+        val executors = mutableListOf<ExecutorService>()
+        val callbacks = mutableListOf<NsdManager.ServiceInfoCallback>()
+        var registrationsFailed = 0
+        var unregistered = false
+
+        fun unregisterAll() {
+            val toUnregister: List<NsdManager.ServiceInfoCallback>
+            synchronized(callbacks) {
+                if (unregistered) {
+                    return
+                }
+                unregistered = true
+                toUnregister = callbacks.toList()
+            }
+            // Only unregister here. NsdManager may still deliver in-flight events on
+            // the registration executors, so they are shut down from
+            // onServiceInfoCallbackUnregistered instead of this method.
+            toUnregister.forEach { callback ->
+                try {
+                    nsdManager.unregisterServiceInfoCallback(callback)
+                } catch (_: IllegalArgumentException) {
+                    // The callback was never registered or is already gone.
+                }
+            }
+        }
+
+        for (network in targets) {
+            val executor =
+                Executors.newSingleThreadExecutor(TerminalThreadFactory(applicationContext))
+            val queryInfo = NsdServiceInfo()
+            queryInfo.serviceType = serviceType
+            queryInfo.serviceName = serviceName
+            if (network != null) {
+                queryInfo.network = network
+            }
+            val callback =
+                object : NsdManager.ServiceInfoCallback {
+                    var found: Boolean = false
+
+                    override fun onServiceInfoCallbackRegistrationFailed(errorCode: Int) {
+                        Log.w(
+                            TAG,
+                            "mDNS registration failed for $serviceName on $network: $errorCode",
                         )
-                    )
-                }
-
-                override fun onServiceInfoCallbackUnregistered() {
-                    executor.shutdown()
-                }
-
-                override fun onServiceLost() {}
-
-                override fun onServiceUpdated(info: NsdServiceInfo) {
-                    Log.i(TAG, "Service found: $info")
-                    val hasUsableAddress = info.hostAddresses.any { !it.isLinkLocalAddress }
-
-                    if (!hasUsableAddress) {
-                        Log.d(TAG, "Global ip addr isn't found, wait more: $info")
-                        return
+                        executor.shutdown()
+                        synchronized(callbacks) {
+                            registrationsFailed++
+                            if (registrationsFailed >= targets.size) {
+                                resolvedInfo.completeExceptionally(
+                                    IllegalStateException(
+                                        "mDNS callback registration failed for $serviceName with code $errorCode"
+                                    )
+                                )
+                            }
+                        }
                     }
 
-                    if (!found && resolvedInfo.complete(info)) {
-                        found = true
-                        try {
-                            nsdManager.unregisterServiceInfoCallback(this)
-                        } catch (_: IllegalArgumentException) {
-                            executor.shutdown()
+                    override fun onServiceInfoCallbackUnregistered() {
+                        executor.shutdown()
+                    }
+
+                    override fun onServiceLost() {}
+
+                    override fun onServiceUpdated(info: NsdServiceInfo) {
+                        Log.i(TAG, "Service found on $network: $info")
+                        val hasUsableAddress = info.hostAddresses.any { !it.isLinkLocalAddress }
+
+                        if (!hasUsableAddress) {
+                            Log.d(TAG, "Global ip addr isn't found, wait more: $info")
+                            return
+                        }
+
+                        if (!found && resolvedInfo.complete(info)) {
+                            found = true
+                            unregisterAll()
                         }
                     }
                 }
+            synchronized(callbacks) {
+                if (unregistered) {
+                    // Discovery already resolved elsewhere; drop this pending
+                    // registration instead of leaking it.
+                    executor.shutdown()
+                    continue
+                }
+                callbacks.add(callback)
+                executors.add(executor)
             }
-        try {
-            nsdManager.registerServiceInfoCallback(queryInfo, executor, callback)
-        } catch (error: RuntimeException) {
-            executor.shutdown()
-            resolvedInfo.completeExceptionally(error)
+            try {
+                nsdManager.registerServiceInfoCallback(queryInfo, executor, callback)
+            } catch (error: RuntimeException) {
+                Log.w(TAG, "mDNS registration threw for $serviceName on $network", error)
+                synchronized(callbacks) {
+                    callbacks.remove(callback)
+                    executors.remove(executor)
+                    registrationsFailed++
+                    if (registrationsFailed >= targets.size) {
+                        resolvedInfo.completeExceptionally(error)
+                    }
+                }
+                executor.shutdown()
+            }
         }
 
         if (timeout_secs > 0) {
             resolvedInfo.orTimeout(timeout_secs.toLong(), TimeUnit.SECONDS)
         }
-        resolvedInfo.whenComplete { _, error ->
-            serviceDiscoveryFutures.remove(resolvedInfo)
-            if (error != null) {
-                try {
-                    nsdManager.unregisterServiceInfoCallback(callback)
-                } catch (_: IllegalArgumentException) {
-                    executor.shutdown()
-                }
-            }
-        }
+        resolvedInfo.whenComplete { _, _ -> unregisterAll() }
         return resolvedInfo
     }
 

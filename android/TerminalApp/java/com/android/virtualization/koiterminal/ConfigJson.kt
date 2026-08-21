@@ -31,6 +31,7 @@ import com.android.virtualization.koiterminal.ConfigJson.InputJson
 import com.android.virtualization.koiterminal.ConfigJson.PartitionJson
 import com.android.virtualization.koiterminal.ConfigJson.SharedPathJson
 import com.google.gson.Gson
+import com.google.gson.JsonObject
 import com.google.gson.annotations.SerializedName
 import java.io.BufferedReader
 import java.io.FileReader
@@ -66,7 +67,7 @@ internal data class ConfigJson(
     private val gpu: GpuJson?,
     private val auto_memory_balloon: Boolean,
     private val boot_timeout_secs: Int?,
-    private val direct_forwarding: DirectForwardingJson? = null,
+    private val direct_forwarding: JsonObject? = null,
 ) {
     private fun getCpuTopology(): Int {
         return when (cpu_topology) {
@@ -93,7 +94,7 @@ internal data class ConfigJson(
      * bound is kept small so image metadata cannot create an unbounded set of host listeners.
      */
     internal fun getDirectForwardingConfig(): DirectForwardingConfig? {
-        return direct_forwarding?.toConfig()
+        return DirectForwardingConfig.fromJson(direct_forwarding)
     }
 
     /** Converts this parsed JSON into VirtualMachineConfig Builder */
