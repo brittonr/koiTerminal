@@ -1,0 +1,42 @@
+diff --git a/build/soong/service_fuzzer_bindings.go b/build/soong/service_fuzzer_bindings.go
+--- a/build/soong/service_fuzzer_bindings.go
++++ b/build/soong/service_fuzzer_bindings.go
+@@ -200,6 +200,7 @@
+ 		"android.system.microfuchsiad":                                   EXCEPTION_NO_FUZZER,
+ 		// TODO(b/294158658): add fuzzer
+ 		"android.hardware.security.keymint.IRemotelyProvisionedComponent/avf": EXCEPTION_NO_FUZZER,
++		"android.system.virtualizationdisplay":                                []string{"virtualizationdisplay_fuzzer"},
+ 		"android.system.virtualizationservice":                                []string{"virtualizationmanager_fuzzer"},
+ 		"android.os.IAccessor/ICommService/security_vm_keymint":               EXCEPTION_NO_FUZZER,
+ 		"android.trusty.commservice.ICommService/security_vm_keymint":         EXCEPTION_NO_FUZZER,
+diff --git a/private/service_contexts b/private/service_contexts
+index 84304c0..f860560 100644
+--- a/private/service_contexts
++++ b/private/service_contexts
+@@ -179,6 +179,7 @@ android.security.maintenance              u:object_r:keystore_maintenance_servic
+ android.security.metrics                  u:object_r:keystore_metrics_service:s0
+ android.service.gatekeeper.IGateKeeperService    u:object_r:gatekeeper_service:s0
+ android.system.composd                    u:object_r:compos_service:s0
++android.system.virtualizationdisplay     u:object_r:virtualizationdisplay_service:s0
+ android.system.virtualizationservice      u:object_r:virtualization_service:s0
+ android.os.IAccessor/ICommService/security_vm_keymint u:object_r:accessor_trusty_keymint_comm_service:s0
+ android.trusty.commservice.ICommService/security_vm_keymint u:object_r:trusty_keymint_comm_service:s0
+diff --git a/private/virtualizationdisplay.te b/private/virtualizationdisplay.te
+new file mode 100644
+index 0000000..6439f3f
+--- /dev/null
++++ b/private/virtualizationdisplay.te
+@@ -0,0 +1,13 @@
++# VM-owned display broker only. Do not expose virtualization_service to apps.
++type virtualizationdisplay_service, app_api_service, service_manager_type;
++add_service(virtualizationservice, virtualizationdisplay_service)
++
++# Every broker lookup checks MANAGE/USE_CUSTOM_VM and the full allocating UID.
++binder_call(untrusted_app, virtualizationservice)
++
++is_flag_enabled(RELEASE_AVF_SUPPORT_CUSTOM_VM_WITH_PARAVIRTUALIZED_DEVICES, `
++    # Surface producers and cursor FDs use kernel Binder, not Binder RPC.
++    # Native DisplayService checks the owning UID on every transaction.
++    binder_call(untrusted_app, crosvm)
++    binder_call(crosvm, untrusted_app)
++')

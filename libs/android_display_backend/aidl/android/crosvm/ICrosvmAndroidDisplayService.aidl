@@ -24,7 +24,8 @@ import android.view.Surface;
  * display.
  */
 interface ICrosvmAndroidDisplayService {
-    void setSurface(inout Surface surface, boolean forCursor);
+    /** The service retains its own window reference; the caller's Surface is not consumed. */
+    void setSurface(in Surface surface, boolean forCursor);
     void setCursorStream(in ParcelFileDescriptor stream);
     void removeSurface(boolean forCursor);
     void saveFrameForSurface(boolean forCursor);

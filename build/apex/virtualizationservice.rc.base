@@ -19,3 +19,4 @@ service virtualizationservice /apex/com.android.virt/bin/virtualizationservice
     disabled
     oneshot
     interface aidl android.system.virtualizationservice
+    interface aidl android.system.virtualizationdisplay

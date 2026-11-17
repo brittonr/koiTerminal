@@ -22,6 +22,7 @@ use crate::atom::{
 use crate::maintenance;
 use crate::remote_provisioning;
 use crate::rkpvm::{generate_ecdsa_p256_key_pair, request_attestation};
+use crate::vm_display::{Error as DisplayAccessError, VmDisplayRegistry};
 use crate::{get_calling_pid, get_calling_uid, REMOTELY_PROVISIONED_COMPONENT_SERVICE_NAME};
 use android_os_permissions_aidl::aidl::android::os::IPermissionController;
 use android_system_virtualizationcommon::aidl::android::system::virtualizationcommon;
@@ -52,14 +53,14 @@ use rustutils::{
 };
 use serde::Deserialize;
 use service_vm_comm::Response;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::ffi::CStr;
 use std::fs::{self, create_dir, remove_dir_all, remove_file, set_permissions, File, Permissions};
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::raw::uid_t;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::thread::JoinHandle;
 use tombstoned_client::{DebuggerdDumpType, TombstonedConnection};
 use virtualizationcommon::{Atom::Atom, Certificate::Certificate};
@@ -68,7 +69,9 @@ use virtualizationmaintenance::{
     IVirtualizationReconciliationCallback::IVirtualizationReconciliationCallback,
 };
 use virtualizationservice::{
-    AssignableDevice::AssignableDevice, IVirtualMachine::IVirtualMachine,
+    AssignableDevice::AssignableDevice,
+    IVirtualMachine::IVirtualMachine,
+    IVirtualMachineDisplayService::{IVirtualMachineDisplayService, ERROR_NOT_READY},
     VirtualMachineDebugInfo::VirtualMachineDebugInfo,
 };
 use virtualizationservice_internal::{
@@ -188,7 +191,6 @@ fn is_valid_guest_cid(cid: Cid) -> bool {
 #[derive(Clone)]
 pub struct VirtualizationServiceInternal {
     state: Arc<Mutex<GlobalState>>,
-    display_service_set: Arc<Condvar>,
     shutdown_monitor: Arc<Mutex<ShutdownMonitor>>,
 }
 
@@ -196,7 +198,6 @@ impl VirtualizationServiceInternal {
     pub fn init() -> VirtualizationServiceInternal {
         let service = VirtualizationServiceInternal {
             state: Arc::new(Mutex::new(GlobalState::new())),
-            display_service_set: Arc::new(Condvar::new()),
             shutdown_monitor: Arc::new(Mutex::new(ShutdownMonitor::new())),
         };
         let service_clone = service.clone();
@@ -206,7 +207,7 @@ impl VirtualizationServiceInternal {
         // ShutdownMonitor is created.
         unsafe {
             service.shutdown_monitor.lock().unwrap().start(move || {
-                service_clone.state.lock().unwrap().virtual_machines.iter().for_each(
+                service_clone.state.lock().unwrap().virtual_machines.running_vms().for_each(
                     |(key, value)| {
                         let cid = *key;
                         let vm = value.0.clone();
@@ -268,7 +269,7 @@ impl VirtualizationServiceInternal {
             .lock()
             .unwrap()
             .virtual_machines
-            .iter()
+            .running_vms()
             .map(|(cid, (vm, _))| (*cid, vm.clone()))
             .collect::<Vec<_>>();
         vms.iter()
@@ -335,65 +336,87 @@ impl Interface for VirtualizationServiceInternal {
     }
 }
 
+fn display_access_error(error: DisplayAccessError) -> Status {
+    match error {
+        DisplayAccessError::AccessDenied => Status::new_exception_str(
+            ExceptionCode::SECURITY,
+            Some("VM is not owned by the caller"),
+        ),
+        DisplayAccessError::NotReady => {
+            Status::new_service_specific_error_str(ERROR_NOT_READY, Some("VM display is not ready"))
+        }
+        _ => Status::new_exception_str(ExceptionCode::ILLEGAL_STATE, Some(error.to_string())),
+    }
+}
+
+fn unlink_display(display: Option<(binder::SpIBinder, DeathRecipient)>) {
+    if let Some((mut binder, mut recipient)) = display {
+        if binder.is_binder_alive() {
+            if let Err(error) = binder.unlink_to_death(&mut recipient) {
+                warn!("Failed to unlink display service: {error:?}");
+            }
+        }
+    }
+}
+
+impl IVirtualMachineDisplayService for VirtualizationServiceInternal {
+    fn getDisplayService(&self, cid: i32) -> binder::Result<binder::SpIBinder> {
+        check_manage_access()?;
+        check_use_custom_virtual_machine()?;
+        let state = self.state.lock().unwrap();
+        let (display, _) = state
+            .virtual_machines
+            .display(cid as Cid, get_calling_uid())
+            .map_err(display_access_error)?;
+        Ok(display.clone())
+    }
+}
+
 impl IVirtualizationServiceInternal for VirtualizationServiceInternal {
-    fn setDisplayService(
-        &self,
-        ibinder: &binder::SpIBinder,
-    ) -> std::result::Result<(), binder::Status> {
+    fn setDisplayService(&self, cid: i32, ibinder: &binder::SpIBinder) -> binder::Result<i64> {
         check_manage_access()?;
         check_use_custom_virtual_machine()?;
 
-        let service = self.clone();
+        let cid = cid as Cid;
+        let uid = get_calling_uid();
+        let mut state = self.state.lock().unwrap();
+        let generation =
+            state.virtual_machines.reserve_display(cid, uid).map_err(display_access_error)?;
+        let weak_state = Arc::downgrade(&self.state);
         let mut dr = DeathRecipient::new(move || {
-            warn!("Display service died. Clearing it.");
-            if let Err(e) = service.clearDisplayService() {
-                error!("Failed to clear display service from death recipient: {:?}", e);
+            if let Some(state) = weak_state.upgrade() {
+                // Death callbacks have no incoming caller identity. Retire only this token.
+                let retired =
+                    state.lock().unwrap().virtual_machines.retire_display(cid, generation);
+                drop(retired);
             }
         });
 
         let mut binder = ibinder.clone();
         binder.link_to_death(&mut dr)?;
+        let old = state
+            .virtual_machines
+            .set_display(cid, uid, generation, (binder, dr))
+            .map_err(display_access_error)?;
+        drop(state);
+        unlink_display(old);
+        Ok(generation)
+    }
 
-        let state = &mut *self.state.lock().unwrap();
-        if let Some((mut old_binder, mut old_dr)) = state.display_service.take() {
-            if old_binder.is_binder_alive() {
-                if let Err(e) = old_binder.unlink_to_death(&mut old_dr) {
-                    error!("Failed to unlink old display service: {:?}", e);
-                }
-            }
-        }
-        state.display_service = Some((ibinder.clone(), dr));
-        self.display_service_set.notify_all();
+    fn clearDisplayService(&self, cid: i32, generation: i64) -> binder::Result<()> {
+        check_manage_access()?;
+        check_use_custom_virtual_machine()?;
+        let retired = self
+            .state
+            .lock()
+            .unwrap()
+            .virtual_machines
+            .clear_display(cid as Cid, get_calling_uid(), generation)
+            .map_err(display_access_error)?;
+        unlink_display(retired);
         Ok(())
     }
 
-    fn clearDisplayService(&self) -> std::result::Result<(), binder::Status> {
-        check_manage_access()?;
-        check_use_custom_virtual_machine()?;
-        let state = &mut *self.state.lock().unwrap();
-        if let Some((mut binder, mut dr)) = state.display_service.take() {
-            if binder.is_binder_alive() {
-                if let Err(e) = binder.unlink_to_death(&mut dr) {
-                    error!("Failed to unlink display service: {:?}", e);
-                }
-            }
-        }
-        self.display_service_set.notify_all();
-        Ok(())
-    }
-
-    fn waitDisplayService(&self) -> std::result::Result<binder::SpIBinder, binder::Status> {
-        check_manage_access()?;
-        check_use_custom_virtual_machine()?;
-        let state = self
-            .display_service_set
-            .wait_while(self.state.lock().unwrap(), |state| state.display_service.is_none())
-            .unwrap();
-        Ok((state.display_service)
-            .as_ref()
-            .map(|(binder, _dr)| binder.clone())
-            .expect("Display service cannot be None in this context"))
-    }
     fn removeMemlockRlimit(&self) -> binder::Result<()> {
         let pid = get_calling_pid();
         let lim = libc::rlimit { rlim_cur: libc::RLIM_INFINITY, rlim_max: libc::RLIM_INFINITY };
@@ -428,7 +451,7 @@ impl IVirtualizationServiceInternal for VirtualizationServiceInternal {
         self.state
             .lock()
             .unwrap()
-            .register_virtual_machine(cid as Cid, vm)
+            .register_virtual_machine(cid as Cid, vm, Arc::downgrade(&self.state))
             .or_binder_exception(ExceptionCode::ILLEGAL_STATE)
     }
 
@@ -845,13 +868,14 @@ fn split_x509_certificate_chain(mut cert_chain: &[u8]) -> Result<Vec<Certificate
 /// of this struct.
 #[derive(Default)]
 struct GlobalState {
-    /// List of VMs currently running.
-    virtual_machines: HashMap<Cid, (Strong<dyn IVirtualMachine>, DeathRecipient)>,
+    /// Allocated CIDs, their authenticated owners, and running VM/display handles.
+    virtual_machines: VmDisplayRegistry<
+        (Strong<dyn IVirtualMachine>, DeathRecipient),
+        (binder::SpIBinder, DeathRecipient),
+    >,
 
     /// State relating to secrets held by (optional) Secretkeeper instance on behalf of VMs.
     sk_state: Option<maintenance::State>,
-
-    display_service: Option<(binder::SpIBinder, DeathRecipient)>,
 }
 
 impl GlobalState {
@@ -906,7 +930,7 @@ impl GlobalState {
     where
         I: Iterator<Item = Cid>,
     {
-        range.find(|cid| !self.virtual_machines.contains_key(cid))
+        range.find(|cid| !self.virtual_machines.contains_cid(*cid))
     }
 
     fn allocate_vm_context(&mut self) -> Result<VmContext> {
@@ -914,7 +938,11 @@ impl GlobalState {
         let temp_dir = format!("{TEMPORARY_DIRECTORY}/{cid}").into();
         let requester_uid = get_calling_uid();
 
-        create_temporary_directory(&temp_dir, Some(requester_uid))?;
+        self.virtual_machines.allocate(cid, requester_uid)?;
+        if let Err(error) = create_temporary_directory(&temp_dir, Some(requester_uid)) {
+            self.virtual_machines.unregister_vm(cid, requester_uid)?;
+            return Err(error);
+        }
         Ok(VmContext {
             cid: cid.try_into().unwrap(),
             tempDir: temp_dir.to_string_lossy().to_string(),
@@ -925,30 +953,36 @@ impl GlobalState {
         &mut self,
         cid: Cid,
         vm: &Strong<dyn IVirtualMachine>,
+        weak_state: Weak<Mutex<GlobalState>>,
     ) -> Result<()> {
+        let uid = get_calling_uid();
+        ensure!(is_valid_guest_cid(cid), "Invalid guest CID {cid}");
+        // virtmgr re-registers surviving VMs after this singleton restarts.
+        self.virtual_machines.adopt(cid, uid)?;
+        let generation = self.virtual_machines.prepare_vm(cid, uid)?;
         let mut dr = DeathRecipient::new(move || {
-            let temp_dir = format!("{TEMPORARY_DIRECTORY}/{cid}").into();
-            remove_temporary_dir(&temp_dir).unwrap_or_else(|e| {
-                warn!("Could not delete temporary directory {temp_dir:?}: {e}");
-            });
+            if let Some(state) = weak_state.upgrade() {
+                let mut state = state.lock().unwrap();
+                if state.virtual_machines.generation_matches(cid, generation) {
+                    // Keep CID allocation locked until its old directory is removed.
+                    let temp_dir = format!("{TEMPORARY_DIRECTORY}/{cid}").into();
+                    remove_temporary_dir(&temp_dir).unwrap_or_else(|e| {
+                        warn!("Could not delete temporary directory {temp_dir:?}: {e}");
+                    });
+                    state.virtual_machines.retire_vm(cid, generation);
+                }
+            }
         });
         vm.as_binder().link_to_death(&mut dr)?;
-        let old_vm = self.virtual_machines.insert(cid, (vm.clone(), dr));
-        if let Some(_old_vm) = old_vm {
-            warn!("CID ({cid}) reuse detected!");
-            // TODO(b/418877672): print more information about old_vm
-        }
+        self.virtual_machines.register_vm(cid, uid, (vm.clone(), dr))?;
         info!("Virtual machine with CID {cid} registered");
         Ok(())
     }
 
     fn unregister_virtual_machine(&mut self, cid: Cid) -> Result<()> {
-        if self.virtual_machines.remove(&cid).is_some() {
-            info!("Virtual machine with CID {cid} unregistered");
-            Ok(())
-        } else {
-            Err(anyhow!("Unknown CID {cid}"))
-        }
+        self.virtual_machines.unregister_vm(cid, get_calling_uid())?;
+        info!("Virtual machine with CID {cid} unregistered");
+        Ok(())
     }
 
     fn get_dtbo_file(&mut self) -> Result<File> {

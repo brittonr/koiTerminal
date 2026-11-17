@@ -59,3 +59,10 @@ cc_library_static {
         "com.android.virt",
     ],
 }
+
+cc_test_host {
+    name: "vm_display_access_test",
+    srcs: ["vm_display_access_test.cpp"],
+    gtest: false,
+    test_suites: ["general-tests"],
+}

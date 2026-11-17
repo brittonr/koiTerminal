@@ -1,0 +1,1411 @@
+diff --git a/android/TerminalApp/Android.bp b/android/TerminalApp/Android.bp
+index 040c86d68..fa8f9d9b4 100644
+--- a/android/TerminalApp/Android.bp
++++ b/android/TerminalApp/Android.bp
+@@ -11,8 +11,6 @@ android_app {
+     asset_dirs: ["assets"],
+     resource_dirs: ["res"],
+     static_libs: [
+-        // TODO(b/330257000): will be removed when binder RPC is used
+-        "android.system.virtualizationservice_internal-java",
+         "androidx-constraintlayout_constraintlayout",
+         "androidx.navigation_navigation-fragment-ktx",
+         "androidx.window_window",
+diff --git a/android/TerminalApp/java/com/android/virtualization/terminal/DisplayActivity.kt b/android/TerminalApp/java/com/android/virtualization/terminal/DisplayActivity.kt
+index 5fb39e1ac..93649d278 100644
+--- a/android/TerminalApp/java/com/android/virtualization/terminal/DisplayActivity.kt
++++ b/android/TerminalApp/java/com/android/virtualization/terminal/DisplayActivity.kt
+@@ -15,12 +15,15 @@
+  */
+ package com.android.virtualization.terminal
+ 
++import android.app.AlertDialog
+ import android.app.PictureInPictureParams
+ import android.content.pm.ActivityInfo
++import android.crosvm.ICrosvmAndroidDisplayService
+ import android.graphics.Rect
+ import android.os.Bundle
+ import android.system.virtualmachine.VirtualMachine
+ import android.system.virtualmachine.VirtualMachineManager
++import android.util.Log
+ import android.view.LayoutInflater
+ import android.view.MotionEvent
+ import android.view.SurfaceView
+@@ -36,7 +39,10 @@ import androidx.constraintlayout.widget.ConstraintLayout
+ import androidx.core.view.ViewCompat
+ import androidx.core.view.WindowInsetsCompat
+ import androidx.core.view.isVisible
++import com.android.virtualization.terminal.MainActivity.Companion.TAG
+ import com.google.android.material.button.MaterialButton
++import java.util.concurrent.ExecutorService
++import java.util.concurrent.Executors
+ 
+ class DisplayActivity : BaseActivity() {
+     private lateinit var mainView: DisplaySurfaceView
+@@ -49,29 +55,75 @@ class DisplayActivity : BaseActivity() {
+     private lateinit var mouseLockButton: MaterialButton
+     private lateinit var displayFlow: androidx.constraintlayout.helper.widget.Flow
+     private lateinit var displayProvider: DisplayProvider
++    private lateinit var displayExecutor: ExecutorService
++    private var displayFailureDialog: AlertDialog? = null
+     private lateinit var pictureInPictureParams: PictureInPictureParams
+     private var hasPointerCapture = false
+     private var debianVm: VirtualMachine? = null
+ 
+     override fun onCreate(savedInstanceState: Bundle?) {
+         super.onCreate(savedInstanceState)
+-        setContentView(R.layout.activity_display)
+-        initializeViews()
+-        val vmm = applicationContext.getSystemService(VirtualMachineManager::class.java)
+-        debianVm = vmm?.get("debian")
+-        // TODO: Add error handling if vmm is missing
+-        debianVm?.let { vm ->
+-            setupDisplayAndInput(vm)
+-            setupUI()
++        displayExecutor =
++            Executors.newSingleThreadExecutor(TerminalThreadFactory(applicationContext))
++        displayExecutor.execute {
++            try {
++                val vmm = applicationContext.getSystemService(VirtualMachineManager::class.java)
++                val vm = checkNotNull(vmm?.get("debian")) { "No Linux VM is available for display" }
++                val config = checkNotNull(vm.config.customImageConfig?.displayConfig) {
++                    "The Linux VM has no display configuration"
++                }
++                val display = ICrosvmAndroidDisplayService.Stub.asInterface(vm.getDisplayService())
++                runOnUiThread {
++                    if (!isFinishing && !isDestroyed) {
++                        debianVm = vm
++                        // Inflate after acquisition so Surface callbacks cannot precede the handle.
++                        setContentView(R.layout.activity_display)
++                        initializeViews()
++                        setupDisplayAndInput(vm, display, config.width, config.height)
++                        setupUI()
++                    }
++                }
++            } catch (error: Exception) {
++                runOnUiThread { failDisplay(error) }
++            } catch (error: NoSuchMethodError) {
++                runOnUiThread {
++                    failDisplay(
++                        UnsupportedOperationException("This OS needs the VM-owned display update", error)
++                    )
++                }
++            }
++        }
++    }
++
++    override fun onDestroy() {
++        displayExecutor.shutdownNow()
++        displayFailureDialog?.dismiss()
++        super.onDestroy()
++    }
++
++    private fun failDisplay(error: Exception) {
++        if (!isFinishing && !isDestroyed && displayFailureDialog == null) {
++            Log.e(TAG, "VM display unavailable", error)
++            // Do not launch the task-clearing ErrorActivity or terminate the VM-owning process.
++            displayFailureDialog =
++                AlertDialog.Builder(this)
++                    .setTitle(android.R.string.dialog_alert_title)
++                    .setMessage(error.message ?: error.toString())
++                    .setPositiveButton(android.R.string.ok) { _, _ -> finish() }
++                    .setOnCancelListener { finish() }
++                    .show()
+         }
+     }
+ 
+-    private fun setupDisplayAndInput(vm: VirtualMachine) {
++    private fun setupDisplayAndInput(
++        vm: VirtualMachine,
++        display: ICrosvmAndroidDisplayService,
++        width: Int,
++        height: Int,
++    ) {
+         // Connect the views to the VM
+-        val width = vm.config.customImageConfig?.displayConfig!!.width
+-        val height = vm.config.customImageConfig?.displayConfig!!.height
+         val ratio = android.util.Rational(width, height)
+-        displayProvider = DisplayProvider(mainView, cursorView, width, height)
++        displayProvider = DisplayProvider(mainView, cursorView, width, height, display, ::failDisplay)
+         InputForwarder(this, vm, mainView, mainView, mainView)
+         // Calculate the screen ratio of the VM
+         (mainView.layoutParams as ConstraintLayout.LayoutParams).dimensionRatio =
+diff --git a/android/TerminalApp/java/com/android/virtualization/terminal/DisplayProvider.kt b/android/TerminalApp/java/com/android/virtualization/terminal/DisplayProvider.kt
+index 954db50b1..365b0b5e7 100644
+--- a/android/TerminalApp/java/com/android/virtualization/terminal/DisplayProvider.kt
++++ b/android/TerminalApp/java/com/android/virtualization/terminal/DisplayProvider.kt
+@@ -20,8 +20,6 @@ import android.graphics.PixelFormat
+ import android.os.DeadObjectException
+ import android.os.ParcelFileDescriptor
+ import android.os.RemoteException
+-import android.os.ServiceManager
+-import android.system.virtualizationservice_internal.IVirtualizationServiceInternal
+ import android.util.Log
+ import android.view.SurfaceControl
+ import android.view.SurfaceHolder
+@@ -41,14 +39,10 @@ internal class DisplayProvider(
+     private val cursorView: SurfaceView,
+     private val width: Int,
+     private val height: Int,
++    private val displayService: ICrosvmAndroidDisplayService,
++    private val onError: (Exception) -> Unit,
+ ) {
+     private var cursorHandler: CursorHandler? = null
+-    private val displayService: ICrosvmAndroidDisplayService by lazy {
+-        val b = ServiceManager.waitForService("android.system.virtualizationservice")
+-        val virtService = IVirtualizationServiceInternal.Stub.asInterface(b)
+-        val b2 = virtService.waitDisplayService()
+-        ICrosvmAndroidDisplayService.Stub.asInterface(b2)
+-    }
+ 
+     init {
+         mainView.setSurfaceLifecycle(SurfaceView.SURFACE_LIFECYCLE_FOLLOWS_ATTACHMENT)
+@@ -77,10 +71,8 @@ internal class DisplayProvider(
+             try {
+                 displayService.setSurface(holder.getSurface(), isForCursor())
+             } catch (e: Exception) {
+-                // TODO: don't consume this exception silently. For some unknown reason, setSurface
+-                // call above throws IllegalArgumentException and that fails the surface
+-                // configuration.
+-                Log.e(TAG, "Failed to present surface $surfaceKind to VM", e)
++                onError(RuntimeException("Failed to present surface $surfaceKind to VM", e))
++                return
+             }
+             try {
+                 if (surfaceKind == SurfaceKind.CURSOR) {
+@@ -88,8 +80,7 @@ internal class DisplayProvider(
+                     displayService.setCursorStream(stream)
+                 }
+             } catch (e: Exception) {
+-                // TODO: don't consume exceptions here too
+-                Log.e(TAG, "Failed to configure surface $surfaceKind", e)
++                onError(RuntimeException("Failed to configure surface $surfaceKind", e))
+             }
+         }
+ 
+@@ -103,8 +94,10 @@ internal class DisplayProvider(
+                 displayService.removeSurface(isForCursor())
+             } catch (e: DeadObjectException) {
+                 Log.w(TAG, "The display service is already dead", e)
++            } catch (e: SecurityException) {
++                onError(RuntimeException("The VM display was revoked", e))
+             } catch (e: RemoteException) {
+-                throw RuntimeException("Error while destroying surface for $surfaceKind", e)
++                onError(RuntimeException("Error while destroying surface for $surfaceKind", e))
+             }
+         }
+     }
+diff --git a/android/virtmgr/src/crosvm.rs b/android/virtmgr/src/crosvm.rs
+index 1dad77572..26adb4aae 100644
+--- a/android/virtmgr/src/crosvm.rs
++++ b/android/virtmgr/src/crosvm.rs
+@@ -2249,6 +2249,8 @@ fn run_vm(config: CrosvmConfig, crosvm_control_socket_path: &Path) -> Result<Sha
+ 
+     command.arg0(config.command.arg0);
+     command.args(config.command.args);
++    // Native display registration must use this VM's allocated CID, not a global slot.
++    command.env("CROSVM_ANDROID_DISPLAY_CID", config.cid.to_string());
+ 
+     // Keep track of what file descriptors should be mapped to the crosvm process.
+     let mut preserved_fds = Vec::new();
+diff --git a/android/virtmgr/src/virtualmachine.rs b/android/virtmgr/src/virtualmachine.rs
+index 4e04ab19f..3c49a752e 100644
+--- a/android/virtmgr/src/virtualmachine.rs
++++ b/android/virtmgr/src/virtualmachine.rs
+@@ -604,6 +604,16 @@ impl VirtualizationService {
+         } else {
+             self.create_vm_context()?
+         };
++        // A failed creation has no VM death recipient or exit monitor to release its CID.
++        let allocation_guard = scopeguard::guard(cid, |cid| {
++            if !cfg!(early) {
++                if let Err(error) =
++                    global_service().unwrap().unregisterVirtualMachine(cid.try_into().unwrap())
++                {
++                    warn!("Failed to release uncreated VM ({cid}): {error:?}");
++                }
++            }
++        });
+ 
+         if is_custom_config(config) {
+             check_use_custom_virtual_machine()?;
+@@ -776,6 +786,7 @@ impl VirtualizationService {
+         register_to_global_service(&vm)
+             .context(format!("Failed to register VM ({cid}) to the global service"))
+             .or_service_specific_exception(-1)?;
++        let _ = scopeguard::ScopeGuard::into_inner(allocation_guard);
+ 
+         Ok(vm)
+     }
+diff --git a/android/virtualizationservice/Android.bp b/android/virtualizationservice/Android.bp
+index c8a7aeaf7..b21c976e1 100644
+--- a/android/virtualizationservice/Android.bp
++++ b/android/virtualizationservice/Android.bp
+@@ -94,6 +94,24 @@ rust_test {
+     ],
+ }
+ 
++rust_test_host {
++    name: "virtualization_display_registry_test",
++    srcs: ["src/vm_display.rs"],
++    edition: "2021",
++    test_suites: ["general-tests"],
++}
++
++cc_fuzz {
++    name: "virtualizationdisplay_fuzzer",
++    defaults: ["service_fuzzer_defaults"],
++    srcs: ["fuzzer.cpp"],
++    static_libs: ["android.system.virtualizationservice-ndk"],
++    shared_libs: [
++        "libbinder_ndk",
++        "liblog",
++    ],
++}
++
+ // The chain originates from a CTS test for Keymint, with the Keymint certificate
+ // (leaf certificate) truncated.
+ //
+diff --git a/android/virtualizationservice/aidl/android/system/virtualizationservice_internal/IVirtualizationServiceInternal.aidl b/android/virtualizationservice/aidl/android/system/virtualizationservice_internal/IVirtualizationServiceInternal.aidl
+index 0749a95f6..8cbf765a3 100644
+--- a/android/virtualizationservice/aidl/android/system/virtualizationservice_internal/IVirtualizationServiceInternal.aidl
++++ b/android/virtualizationservice/aidl/android/system/virtualizationservice_internal/IVirtualizationServiceInternal.aidl
+@@ -135,10 +135,10 @@ interface IVirtualizationServiceInternal {
+      */
+     void claimVmInstance(in byte[64] instanceId);
+ 
+-    // TODO(b/330257000): Remove these functions when a display service is running with binder RPC.
+-    void setDisplayService(IBinder ibinder);
+-    void clearDisplayService();
+-    IBinder waitDisplayService();
++    /** Registers a display for the caller's allocated/registered VM; returns its generation. */
++    long setDisplayService(int cid, IBinder ibinder);
++    /** Clears only this registration, never a later display that reused the CID. */
++    void clearDisplayService(int cid, long generation);
+ 
+     /**
+      * Create TAP network interface for a VM.
+diff --git a/android/virtualizationservice/src/aidl.rs b/android/virtualizationservice/src/aidl.rs
+index 72b61a670..331063524 100644
+--- a/android/virtualizationservice/src/aidl.rs
++++ b/android/virtualizationservice/src/aidl.rs
+@@ -22,6 +22,7 @@ use crate::atom::{
+ use crate::maintenance;
+ use crate::remote_provisioning;
+ use crate::rkpvm::{generate_ecdsa_p256_key_pair, request_attestation};
++use crate::vm_display::{Error as DisplayAccessError, VmDisplayRegistry};
+ use crate::{get_calling_pid, get_calling_uid, REMOTELY_PROVISIONED_COMPONENT_SERVICE_NAME};
+ use android_os_permissions_aidl::aidl::android::os::IPermissionController;
+ use android_system_virtualizationcommon::aidl::android::system::virtualizationcommon;
+@@ -52,14 +53,14 @@ use rustutils::{
+ };
+ use serde::Deserialize;
+ use service_vm_comm::Response;
+-use std::collections::{HashMap, HashSet};
++use std::collections::HashSet;
+ use std::ffi::CStr;
+ use std::fs::{self, create_dir, remove_dir_all, remove_file, set_permissions, File, Permissions};
+ use std::io::{Read, Write};
+ use std::os::unix::fs::PermissionsExt;
+ use std::os::unix::raw::uid_t;
+ use std::path::{Path, PathBuf};
+-use std::sync::{Arc, Condvar, LazyLock, Mutex};
++use std::sync::{Arc, LazyLock, Mutex, Weak};
+ use std::thread::JoinHandle;
+ use tombstoned_client::{DebuggerdDumpType, TombstonedConnection};
+ use virtualizationcommon::{Atom::Atom, Certificate::Certificate};
+@@ -68,7 +69,9 @@ use virtualizationmaintenance::{
+     IVirtualizationReconciliationCallback::IVirtualizationReconciliationCallback,
+ };
+ use virtualizationservice::{
+-    AssignableDevice::AssignableDevice, IVirtualMachine::IVirtualMachine,
++    AssignableDevice::AssignableDevice,
++    IVirtualMachine::IVirtualMachine,
++    IVirtualMachineDisplayService::{IVirtualMachineDisplayService, ERROR_NOT_READY},
+     VirtualMachineDebugInfo::VirtualMachineDebugInfo,
+ };
+ use virtualizationservice_internal::{
+@@ -188,7 +191,6 @@ fn is_valid_guest_cid(cid: Cid) -> bool {
+ #[derive(Clone)]
+ pub struct VirtualizationServiceInternal {
+     state: Arc<Mutex<GlobalState>>,
+-    display_service_set: Arc<Condvar>,
+     shutdown_monitor: Arc<Mutex<ShutdownMonitor>>,
+ }
+ 
+@@ -196,7 +198,6 @@ impl VirtualizationServiceInternal {
+     pub fn init() -> VirtualizationServiceInternal {
+         let service = VirtualizationServiceInternal {
+             state: Arc::new(Mutex::new(GlobalState::new())),
+-            display_service_set: Arc::new(Condvar::new()),
+             shutdown_monitor: Arc::new(Mutex::new(ShutdownMonitor::new())),
+         };
+         let service_clone = service.clone();
+@@ -206,7 +207,7 @@ impl VirtualizationServiceInternal {
+         // ShutdownMonitor is created.
+         unsafe {
+             service.shutdown_monitor.lock().unwrap().start(move || {
+-                service_clone.state.lock().unwrap().virtual_machines.iter().for_each(
++                service_clone.state.lock().unwrap().virtual_machines.running_vms().for_each(
+                     |(key, value)| {
+                         let cid = *key;
+                         let vm = value.0.clone();
+@@ -268,7 +269,7 @@ impl VirtualizationServiceInternal {
+             .lock()
+             .unwrap()
+             .virtual_machines
+-            .iter()
++            .running_vms()
+             .map(|(cid, (vm, _))| (*cid, vm.clone()))
+             .collect::<Vec<_>>();
+         vms.iter()
+@@ -335,65 +336,87 @@ impl Interface for VirtualizationServiceInternal {
+     }
+ }
+ 
++fn display_access_error(error: DisplayAccessError) -> Status {
++    match error {
++        DisplayAccessError::AccessDenied => Status::new_exception_str(
++            ExceptionCode::SECURITY,
++            Some("VM is not owned by the caller"),
++        ),
++        DisplayAccessError::NotReady => {
++            Status::new_service_specific_error_str(ERROR_NOT_READY, Some("VM display is not ready"))
++        }
++        _ => Status::new_exception_str(ExceptionCode::ILLEGAL_STATE, Some(error.to_string())),
++    }
++}
++
++fn unlink_display(display: Option<(binder::SpIBinder, DeathRecipient)>) {
++    if let Some((mut binder, mut recipient)) = display {
++        if binder.is_binder_alive() {
++            if let Err(error) = binder.unlink_to_death(&mut recipient) {
++                warn!("Failed to unlink display service: {error:?}");
++            }
++        }
++    }
++}
++
++impl IVirtualMachineDisplayService for VirtualizationServiceInternal {
++    fn getDisplayService(&self, cid: i32) -> binder::Result<binder::SpIBinder> {
++        check_manage_access()?;
++        check_use_custom_virtual_machine()?;
++        let state = self.state.lock().unwrap();
++        let (display, _) = state
++            .virtual_machines
++            .display(cid as Cid, get_calling_uid())
++            .map_err(display_access_error)?;
++        Ok(display.clone())
++    }
++}
++
+ impl IVirtualizationServiceInternal for VirtualizationServiceInternal {
+-    fn setDisplayService(
+-        &self,
+-        ibinder: &binder::SpIBinder,
+-    ) -> std::result::Result<(), binder::Status> {
++    fn setDisplayService(&self, cid: i32, ibinder: &binder::SpIBinder) -> binder::Result<i64> {
+         check_manage_access()?;
+         check_use_custom_virtual_machine()?;
+ 
+-        let service = self.clone();
++        let cid = cid as Cid;
++        let uid = get_calling_uid();
++        let mut state = self.state.lock().unwrap();
++        let generation =
++            state.virtual_machines.reserve_display(cid, uid).map_err(display_access_error)?;
++        let weak_state = Arc::downgrade(&self.state);
+         let mut dr = DeathRecipient::new(move || {
+-            warn!("Display service died. Clearing it.");
+-            if let Err(e) = service.clearDisplayService() {
+-                error!("Failed to clear display service from death recipient: {:?}", e);
++            if let Some(state) = weak_state.upgrade() {
++                // Death callbacks have no incoming caller identity. Retire only this token.
++                let retired =
++                    state.lock().unwrap().virtual_machines.retire_display(cid, generation);
++                drop(retired);
+             }
+         });
+ 
+         let mut binder = ibinder.clone();
+         binder.link_to_death(&mut dr)?;
+-
+-        let state = &mut *self.state.lock().unwrap();
+-        if let Some((mut old_binder, mut old_dr)) = state.display_service.take() {
+-            if old_binder.is_binder_alive() {
+-                if let Err(e) = old_binder.unlink_to_death(&mut old_dr) {
+-                    error!("Failed to unlink old display service: {:?}", e);
+-                }
+-            }
+-        }
+-        state.display_service = Some((ibinder.clone(), dr));
+-        self.display_service_set.notify_all();
+-        Ok(())
++        let old = state
++            .virtual_machines
++            .set_display(cid, uid, generation, (binder, dr))
++            .map_err(display_access_error)?;
++        drop(state);
++        unlink_display(old);
++        Ok(generation)
+     }
+ 
+-    fn clearDisplayService(&self) -> std::result::Result<(), binder::Status> {
++    fn clearDisplayService(&self, cid: i32, generation: i64) -> binder::Result<()> {
+         check_manage_access()?;
+         check_use_custom_virtual_machine()?;
+-        let state = &mut *self.state.lock().unwrap();
+-        if let Some((mut binder, mut dr)) = state.display_service.take() {
+-            if binder.is_binder_alive() {
+-                if let Err(e) = binder.unlink_to_death(&mut dr) {
+-                    error!("Failed to unlink display service: {:?}", e);
+-                }
+-            }
+-        }
+-        self.display_service_set.notify_all();
++        let retired = self
++            .state
++            .lock()
++            .unwrap()
++            .virtual_machines
++            .clear_display(cid as Cid, get_calling_uid(), generation)
++            .map_err(display_access_error)?;
++        unlink_display(retired);
+         Ok(())
+     }
+ 
+-    fn waitDisplayService(&self) -> std::result::Result<binder::SpIBinder, binder::Status> {
+-        check_manage_access()?;
+-        check_use_custom_virtual_machine()?;
+-        let state = self
+-            .display_service_set
+-            .wait_while(self.state.lock().unwrap(), |state| state.display_service.is_none())
+-            .unwrap();
+-        Ok((state.display_service)
+-            .as_ref()
+-            .map(|(binder, _dr)| binder.clone())
+-            .expect("Display service cannot be None in this context"))
+-    }
+     fn removeMemlockRlimit(&self) -> binder::Result<()> {
+         let pid = get_calling_pid();
+         let lim = libc::rlimit { rlim_cur: libc::RLIM_INFINITY, rlim_max: libc::RLIM_INFINITY };
+@@ -428,7 +451,7 @@ impl IVirtualizationServiceInternal for VirtualizationServiceInternal {
+         self.state
+             .lock()
+             .unwrap()
+-            .register_virtual_machine(cid as Cid, vm)
++            .register_virtual_machine(cid as Cid, vm, Arc::downgrade(&self.state))
+             .or_binder_exception(ExceptionCode::ILLEGAL_STATE)
+     }
+ 
+@@ -845,13 +868,14 @@ fn split_x509_certificate_chain(mut cert_chain: &[u8]) -> Result<Vec<Certificate
+ /// of this struct.
+ #[derive(Default)]
+ struct GlobalState {
+-    /// List of VMs currently running.
+-    virtual_machines: HashMap<Cid, (Strong<dyn IVirtualMachine>, DeathRecipient)>,
++    /// Allocated CIDs, their authenticated owners, and running VM/display handles.
++    virtual_machines: VmDisplayRegistry<
++        (Strong<dyn IVirtualMachine>, DeathRecipient),
++        (binder::SpIBinder, DeathRecipient),
++    >,
+ 
+     /// State relating to secrets held by (optional) Secretkeeper instance on behalf of VMs.
+     sk_state: Option<maintenance::State>,
+-
+-    display_service: Option<(binder::SpIBinder, DeathRecipient)>,
+ }
+ 
+ impl GlobalState {
+@@ -906,7 +930,7 @@ impl GlobalState {
+     where
+         I: Iterator<Item = Cid>,
+     {
+-        range.find(|cid| !self.virtual_machines.contains_key(cid))
++        range.find(|cid| !self.virtual_machines.contains_cid(*cid))
+     }
+ 
+     fn allocate_vm_context(&mut self) -> Result<VmContext> {
+@@ -914,7 +938,11 @@ impl GlobalState {
+         let temp_dir = format!("{TEMPORARY_DIRECTORY}/{cid}").into();
+         let requester_uid = get_calling_uid();
+ 
+-        create_temporary_directory(&temp_dir, Some(requester_uid))?;
++        self.virtual_machines.allocate(cid, requester_uid)?;
++        if let Err(error) = create_temporary_directory(&temp_dir, Some(requester_uid)) {
++            self.virtual_machines.unregister_vm(cid, requester_uid)?;
++            return Err(error);
++        }
+         Ok(VmContext {
+             cid: cid.try_into().unwrap(),
+             tempDir: temp_dir.to_string_lossy().to_string(),
+@@ -925,30 +953,36 @@ impl GlobalState {
+         &mut self,
+         cid: Cid,
+         vm: &Strong<dyn IVirtualMachine>,
++        weak_state: Weak<Mutex<GlobalState>>,
+     ) -> Result<()> {
++        let uid = get_calling_uid();
++        ensure!(is_valid_guest_cid(cid), "Invalid guest CID {cid}");
++        // virtmgr re-registers surviving VMs after this singleton restarts.
++        self.virtual_machines.adopt(cid, uid)?;
++        let generation = self.virtual_machines.prepare_vm(cid, uid)?;
+         let mut dr = DeathRecipient::new(move || {
+-            let temp_dir = format!("{TEMPORARY_DIRECTORY}/{cid}").into();
+-            remove_temporary_dir(&temp_dir).unwrap_or_else(|e| {
+-                warn!("Could not delete temporary directory {temp_dir:?}: {e}");
+-            });
++            if let Some(state) = weak_state.upgrade() {
++                let mut state = state.lock().unwrap();
++                if state.virtual_machines.generation_matches(cid, generation) {
++                    // Keep CID allocation locked until its old directory is removed.
++                    let temp_dir = format!("{TEMPORARY_DIRECTORY}/{cid}").into();
++                    remove_temporary_dir(&temp_dir).unwrap_or_else(|e| {
++                        warn!("Could not delete temporary directory {temp_dir:?}: {e}");
++                    });
++                    state.virtual_machines.retire_vm(cid, generation);
++                }
++            }
+         });
+         vm.as_binder().link_to_death(&mut dr)?;
+-        let old_vm = self.virtual_machines.insert(cid, (vm.clone(), dr));
+-        if let Some(_old_vm) = old_vm {
+-            warn!("CID ({cid}) reuse detected!");
+-            // TODO(b/418877672): print more information about old_vm
+-        }
++        self.virtual_machines.register_vm(cid, uid, (vm.clone(), dr))?;
+         info!("Virtual machine with CID {cid} registered");
+         Ok(())
+     }
+ 
+     fn unregister_virtual_machine(&mut self, cid: Cid) -> Result<()> {
+-        if self.virtual_machines.remove(&cid).is_some() {
+-            info!("Virtual machine with CID {cid} unregistered");
+-            Ok(())
+-        } else {
+-            Err(anyhow!("Unknown CID {cid}"))
+-        }
++        self.virtual_machines.unregister_vm(cid, get_calling_uid())?;
++        info!("Virtual machine with CID {cid} unregistered");
++        Ok(())
+     }
+ 
+     fn get_dtbo_file(&mut self) -> Result<File> {
+diff --git a/android/virtualizationservice/src/main.rs b/android/virtualizationservice/src/main.rs
+index 55245f6af..6480bfb55 100644
+--- a/android/virtualizationservice/src/main.rs
++++ b/android/virtualizationservice/src/main.rs
+@@ -19,6 +19,7 @@ mod atom;
+ mod maintenance;
+ mod remote_provisioning;
+ mod rkpvm;
++mod vm_display;
+ 
+ use crate::aidl::{
+     is_remote_provisioning_hal_declared, remove_temporary_dir, VirtualizationServiceInternal,
+@@ -26,6 +27,9 @@ use crate::aidl::{
+ };
+ use android_logger::{Config, FilterBuilder};
+ use android_system_virtualizationmaintenance::aidl::android::system::virtualizationmaintenance;
++use android_system_virtualizationservice::aidl::android::system::virtualizationservice::IVirtualMachineDisplayService::{
++    BnVirtualMachineDisplayService, SERVICE_NAME as DISPLAY_SERVICE_NAME,
++};
+ use android_system_virtualizationservice_internal::aidl::android::system::virtualizationservice_internal;
+ use anyhow::{bail, Context, Error, Result};
+ use binder::{register_lazy_service, BinderFeatures, ProcessState, ThreadState};
+@@ -84,6 +88,10 @@ fn try_main() -> Result<()> {
+         BnVirtualizationServiceInternal::new_binder(service.clone(), BinderFeatures::default());
+     register(INTERNAL_SERVICE_NAME, internal_service)?;
+ 
++    let display_service =
++        BnVirtualMachineDisplayService::new_binder(service.clone(), BinderFeatures::default());
++    register(DISPLAY_SERVICE_NAME, display_service)?;
++
+     if is_remote_provisioning_hal_declared().unwrap_or(false) {
+         // The IRemotelyProvisionedComponent service is only supposed to be triggered by rkpd for
+         // RKP VM attestation.
+diff --git a/build/apex/virtualizationservice.rc.base b/build/apex/virtualizationservice.rc.base
+index 688db10cc..b1c644fc1 100644
+--- a/build/apex/virtualizationservice.rc.base
++++ b/build/apex/virtualizationservice.rc.base
+@@ -19,3 +19,4 @@ service virtualizationservice /apex/com.android.virt/bin/virtualizationservice
+     disabled
+     oneshot
+     interface aidl android.system.virtualizationservice
++    interface aidl android.system.virtualizationdisplay
+diff --git a/libs/android_display_backend/Android.bp b/libs/android_display_backend/Android.bp
+index df31baf24..5c5002b25 100644
+--- a/libs/android_display_backend/Android.bp
++++ b/libs/android_display_backend/Android.bp
+@@ -59,3 +59,10 @@ cc_library_static {
+         "com.android.virt",
+     ],
+ }
++
++cc_test_host {
++    name: "vm_display_access_test",
++    srcs: ["vm_display_access_test.cpp"],
++    gtest: false,
++    test_suites: ["general-tests"],
++}
+diff --git a/libs/android_display_backend/aidl/android/crosvm/ICrosvmAndroidDisplayService.aidl b/libs/android_display_backend/aidl/android/crosvm/ICrosvmAndroidDisplayService.aidl
+index 77e3a8c49..d747d96b7 100644
+--- a/libs/android_display_backend/aidl/android/crosvm/ICrosvmAndroidDisplayService.aidl
++++ b/libs/android_display_backend/aidl/android/crosvm/ICrosvmAndroidDisplayService.aidl
+@@ -24,7 +24,8 @@ import android.view.Surface;
+  * display.
+  */
+ interface ICrosvmAndroidDisplayService {
+-    void setSurface(inout Surface surface, boolean forCursor);
++    /** The service retains its own window reference; the caller's Surface is not consumed. */
++    void setSurface(in Surface surface, boolean forCursor);
+     void setCursorStream(in ParcelFileDescriptor stream);
+     void removeSurface(boolean forCursor);
+     void saveFrameForSurface(boolean forCursor);
+diff --git a/libs/android_display_backend/crosvm_android_display_client.cpp b/libs/android_display_backend/crosvm_android_display_client.cpp
+index d333cf47f..8755f5ab1 100644
+--- a/libs/android_display_backend/crosvm_android_display_client.cpp
++++ b/libs/android_display_backend/crosvm_android_display_client.cpp
+@@ -16,16 +16,21 @@
+ 
+ #include <aidl/android/crosvm/BnCrosvmAndroidDisplayService.h>
+ #include <aidl/android/system/virtualizationservice_internal/IVirtualizationServiceInternal.h>
++#include <android-base/parseint.h>
+ #include <android-base/result.h>
++#include <android/binder_ibinder.h>
+ #include <android/binder_manager.h>
+ #include <android/binder_process.h>
+ #include <system/graphics.h> // for HAL_PIXEL_FORMAT_*
++#include <unistd.h>
+ 
+ #include <condition_variable>
++#include <cstdlib>
+ #include <memory>
+ #include <mutex>
+ 
+ #include "surface_control_dl.h"
++#include "vm_display_access.h"
+ 
+ using aidl::android::crosvm::BnCrosvmAndroidDisplayService;
+ using aidl::android::system::virtualizationservice_internal::IVirtualizationServiceInternal;
+@@ -82,17 +87,15 @@ class AndroidDisplaySurface {
+ public:
+     AndroidDisplaySurface(const std::string& name) : mName(name) {}
+ 
+-    Result<void> setNativeSurface(Surface* surface) {
++    Result<void> setNativeSurface(const Surface& surface) {
+         {
+             std::lock_guard lk(mSurfaceMutex);
+-            mNativeSurface = std::make_unique<Surface>(surface->release());
+-            mNativeSurfaceNeedsConfiguring = true;
+-            Surface* surface = mNativeSurface.get();
+-            if (!surface) {
+-                return Error() << "Failed to get Surface";
++            ANativeWindow* anw = surface.get();
++            if (anw == nullptr) {
++                return Error() << "Failed to get native window";
+             }
+-
+-            ANativeWindow* anw = surface->get();
++            mNativeSurface = std::make_unique<Surface>(anw);
++            mNativeSurfaceNeedsConfiguring = true;
+             auto& sc = SurfaceControl::GetInstance();
+             if (sc.IsSupported()) {
+                 mSurfaceControl = sc.ASurfaceControl_createFromWindow(anw, mName.c_str());
+@@ -315,26 +318,42 @@ private:
+ 
+ class DisplayService : public BnCrosvmAndroidDisplayService {
+ public:
+-    DisplayService() = default;
++    DisplayService() : mAccess(getuid()) {}
+     virtual ~DisplayService() = default;
+ 
+-    ndk::ScopedAStatus setSurface(Surface* surface, bool forCursor) override {
+-        getSurface(forCursor).setNativeSurface(surface);
++    void deactivate() {
++        std::lock_guard lock(mLifecycleMutex);
++        mAccess.revoke();
++    }
++
++    ndk::ScopedAStatus setSurface(const Surface& surface, bool forCursor) override {
++        std::lock_guard lock(mLifecycleMutex);
++        if (auto status = checkCallerLocked(); !status.isOk()) return status;
++        if (auto ret = getSurface(forCursor).setNativeSurface(surface); !ret.ok()) {
++            return ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
++                    -1, ret.error().message().c_str());
++        }
+         return ::ndk::ScopedAStatus::ok();
+     }
+ 
+     ndk::ScopedAStatus removeSurface(bool forCursor) override {
++        std::lock_guard lock(mLifecycleMutex);
++        if (auto status = checkCallerLocked(); !status.isOk()) return status;
+         getSurface(forCursor).removeSurface();
+         return ::ndk::ScopedAStatus::ok();
+     }
+ 
+     ndk::ScopedFileDescriptor& getCursorStream() { return mCursorStream; }
+-    ndk::ScopedAStatus setCursorStream(const ndk::ScopedFileDescriptor& in_stream) {
++    ndk::ScopedAStatus setCursorStream(const ndk::ScopedFileDescriptor& in_stream) override {
++        std::lock_guard lock(mLifecycleMutex);
++        if (auto status = checkCallerLocked(); !status.isOk()) return status;
+         mCursorStream = ndk::ScopedFileDescriptor(dup(in_stream.get()));
+         return ::ndk::ScopedAStatus::ok();
+     }
+ 
+     ndk::ScopedAStatus saveFrameForSurface(bool forCursor) override {
++        std::lock_guard lock(mLifecycleMutex);
++        if (auto status = checkCallerLocked(); !status.isOk()) return status;
+         if (auto ret = getSurface(forCursor).saveFrame(); !ret.ok()) {
+             std::string msg = std::format("Failed to save frame: {}", ret.error().message());
+             return ::ndk::ScopedAStatus(
+@@ -344,6 +363,8 @@ public:
+     }
+ 
+     ndk::ScopedAStatus drawSavedFrameForSurface(bool forCursor) override {
++        std::lock_guard lock(mLifecycleMutex);
++        if (auto status = checkCallerLocked(); !status.isOk()) return status;
+         if (auto ret = getSurface(forCursor).drawSavedFrame(); !ret.ok()) {
+             std::string msg = std::format("Failed to draw saved frame: {}", ret.error().message());
+             return ::ndk::ScopedAStatus(
+@@ -361,6 +382,16 @@ public:
+     }
+ 
+ private:
++    ndk::ScopedAStatus checkCallerLocked() const {
++        if (!mAccess.permits(AIBinder_getCallingUid())) {
++            return ndk::ScopedAStatus::fromExceptionCodeWithMessage(
++                    EX_SECURITY, "VM display is not available to this caller");
++        }
++        return ndk::ScopedAStatus::ok();
++    }
++
++    std::mutex mLifecycleMutex;
++    VmDisplayAccess mAccess;
+     AndroidDisplaySurface mScanout{"scanout"};
+     AndroidDisplaySurface mCursor{"cursor"};
+     ndk::ScopedFileDescriptor mCursorStream;
+@@ -373,9 +404,16 @@ typedef void (*ErrorCallback)(const char* message);
+ struct AndroidDisplayContext {
+     std::shared_ptr<IVirtualizationServiceInternal> virt_service;
+     std::shared_ptr<DisplayService> disp_service;
++    int32_t cid = 0;
++    int64_t display_generation = 0;
+     ErrorCallback error_callback;
+ 
+     AndroidDisplayContext(ErrorCallback cb) : error_callback(cb) {
++        const char* cid_env = std::getenv("CROSVM_ANDROID_DISPLAY_CID");
++        if (cid_env == nullptr || !android::base::ParseInt(cid_env, &cid, 3)) {
++            errorf("Missing or invalid VM display CID");
++            return;
++        }
+         auto disp_service = ::ndk::SharedRefBase::make<DisplayService>();
+ 
+         // Creates DisplayService and register it to the virtualizationservice. This is needed
+@@ -387,7 +425,8 @@ struct AndroidDisplayContext {
+             errorf("Failed to find virtualization service");
+             return;
+         }
+-        auto status = virt_service->setDisplayService(disp_service->asBinder());
++        auto status = virt_service->setDisplayService(cid, disp_service->asBinder(),
++                                                     &display_generation);
+         if (!status.isOk()) {
+             errorf("Failed to register display service");
+             return;
+@@ -399,11 +438,13 @@ struct AndroidDisplayContext {
+     }
+ 
+     ~AndroidDisplayContext() {
++        if (disp_service != nullptr) {
++            disp_service->deactivate();
++        }
+         if (virt_service == nullptr) {
+-            errorf("Not connected to virtualization service");
+             return;
+         }
+-        auto status = this->virt_service->clearDisplayService();
++        auto status = virt_service->clearDisplayService(cid, display_generation);
+         if (!status.isOk()) {
+             errorf("Failed to clear display service");
+         }
+diff --git a/libs/framework-virtualization/api/system-current.txt b/libs/framework-virtualization/api/system-current.txt
+index e915802e0..e7ad09389 100644
+--- a/libs/framework-virtualization/api/system-current.txt
++++ b/libs/framework-virtualization/api/system-current.txt
+@@ -9,6 +9,7 @@ package android.system.virtualmachine {
+     method @NonNull @WorkerThread public android.os.ParcelFileDescriptor connectVsock(@IntRange(from=android.system.virtualmachine.VirtualMachine.MIN_VSOCK_PORT, to=android.system.virtualmachine.VirtualMachine.MAX_VSOCK_PORT) long) throws android.system.virtualmachine.VirtualMachineException;
+     method @NonNull @WorkerThread public android.system.virtualmachine.VirtualMachineConfig getConfig();
+     method @NonNull @WorkerThread public java.io.InputStream getConsoleOutput() throws android.system.virtualmachine.VirtualMachineException;
++    method @FlaggedApi("com.android.system.virtualmachine.flags.terminal_gui_support") @NonNull @RequiresPermission(allOf={android.system.virtualmachine.VirtualMachine.MANAGE_VIRTUAL_MACHINE_PERMISSION, android.system.virtualmachine.VirtualMachine.USE_CUSTOM_VIRTUAL_MACHINE_PERMISSION}) @WorkerThread public android.os.IBinder getDisplayService() throws android.system.virtualmachine.VirtualMachineException;
+     method @NonNull @WorkerThread public java.io.InputStream getLogOutput() throws android.system.virtualmachine.VirtualMachineException;
+     method @NonNull public String getName();
+     method @WorkerThread public int getStatus();
+diff --git a/libs/framework-virtualization/src/android/system/virtualmachine/VirtualMachine.java b/libs/framework-virtualization/src/android/system/virtualmachine/VirtualMachine.java
+index 83cf53de5..118f53506 100644
+--- a/libs/framework-virtualization/src/android/system/virtualmachine/VirtualMachine.java
++++ b/libs/framework-virtualization/src/android/system/virtualmachine/VirtualMachine.java
+@@ -43,6 +43,7 @@ import static android.system.virtualmachine.VirtualMachineCallback.STOP_REASON_V
+ import static java.util.Objects.requireNonNull;
+ 
+ import android.annotation.CallbackExecutor;
++import android.annotation.FlaggedApi;
+ import android.annotation.IntDef;
+ import android.annotation.IntRange;
+ import android.annotation.NonNull;
+@@ -62,6 +63,7 @@ import android.os.Build;
+ import android.os.IBinder;
+ import android.os.ParcelFileDescriptor;
+ import android.os.RemoteException;
++import android.os.ServiceManager;
+ import android.os.ServiceSpecificException;
+ import android.system.ErrnoException;
+ import android.system.OsConstants;
+@@ -70,6 +72,7 @@ import android.system.virtualizationcommon.ErrorCode;
+ import android.system.virtualizationcommon.IEncryptedStoreKEK;
+ import android.system.virtualizationservice.IVirtualMachine;
+ import android.system.virtualizationservice.IVirtualMachineCallback;
++import android.system.virtualizationservice.IVirtualMachineDisplayService;
+ import android.system.virtualizationservice.IVirtualizationService;
+ import android.system.virtualizationservice.InputDevice;
+ import android.system.virtualizationservice.PartitionType;
+@@ -82,6 +85,7 @@ import android.util.Pair;
+ import android.view.MotionEvent;
+ 
+ import com.android.internal.annotations.GuardedBy;
++import com.android.system.virtualmachine.flags.Flags;
+ 
+ import libcore.io.IoBridge;
+ import libcore.io.IoUtils;
+@@ -2260,6 +2264,40 @@ public class VirtualMachine implements AutoCloseable {
+         }
+     }
+ 
++    /**
++     * Obtains the native display handle for this running VM.
++     *
++     * <p>The display uses kernel Binder: native Surface producers cannot be forwarded through
++     * the virtmgr Binder-RPC connection. The broker authenticates the full calling UID; the
++     * returned display also checks that UID on every call. This never waits for a global display.
++     *
++     * @throws VirtualMachineException if the VM/display is unavailable
++     * @hide
++     */
++    @SystemApi
++    @FlaggedApi(Flags.FLAG_TERMINAL_GUI_SUPPORT)
++    @WorkerThread
++    @NonNull
++    @RequiresPermission(
++            allOf = {MANAGE_VIRTUAL_MACHINE_PERMISSION, USE_CUSTOM_VIRTUAL_MACHINE_PERMISSION})
++    public IBinder getDisplayService() throws VirtualMachineException {
++        synchronized (mLock) {
++            getRunningVm();
++            IBinder broker = ServiceManager.checkService(IVirtualMachineDisplayService.SERVICE_NAME);
++            if (broker == null) {
++                throw new VirtualMachineException("This OS has no VM-owned display broker");
++            }
++            try {
++                IBinder display =
++                        IVirtualMachineDisplayService.Stub.asInterface(broker).getDisplayService(mCid);
++                Binder.allowBlocking(display);
++                return display;
++            } catch (RemoteException | ServiceSpecificException | SecurityException e) {
++                throw new VirtualMachineException(e);
++            }
++        }
++    }
++
+     private int validatePort(long port) {
+         // Ports below 1024 are "privileged" (payload code can't bind to these), and port numbers
+         // are 32-bit unsigned numbers at the OS level, even though we pass them as 32-bit signed
+diff --git a/android/virtualizationservice/src/vm_display.rs b/android/virtualizationservice/src/vm_display.rs
+new file mode 100644
+index 000000000..ebc44bed9
+--- /dev/null
++++ b/android/virtualizationservice/src/vm_display.rs
+@@ -0,0 +1,366 @@
++// Copyright 2026 The Android Open Source Project
++// SPDX-License-Identifier: Apache-2.0
++
++//! VM/display ownership and stale-death protection, independent of Binder.
++
++use std::collections::HashMap;
++use std::fmt;
++
++#[derive(Debug, Eq, PartialEq)]
++pub(crate) enum Error {
++    AccessDenied,
++    AlreadyAllocated,
++    AlreadyRunning,
++    NotReady,
++    GenerationExhausted,
++}
++
++impl fmt::Display for Error {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str(match self {
++            Self::AccessDenied => "VM is not owned by the caller",
++            Self::AlreadyAllocated => "VM CID is already allocated",
++            Self::AlreadyRunning => "VM is already registered or its exit is unconfirmed",
++            Self::NotReady => "VM display is not ready",
++            Self::GenerationExhausted => "VM display generation exhausted",
++        })
++    }
++}
++
++impl std::error::Error for Error {}
++
++enum VmSlot<V> {
++    Allocated,
++    Running(V),
++    Retired,
++}
++
++struct Entry<V, D> {
++    owner_uid: u32,
++    generation: i64,
++    vm: VmSlot<V>,
++    display: Option<(i64, D)>,
++}
++
++/// Owns the same handles that keep VM and display death recipients linked.
++/// The UID is captured at CID allocation, never supplied by an app argument.
++pub(crate) struct VmDisplayRegistry<V, D> {
++    entries: HashMap<u32, Entry<V, D>>,
++    generation: i64,
++}
++
++impl<V, D> Default for VmDisplayRegistry<V, D> {
++    fn default() -> Self {
++        Self { entries: HashMap::new(), generation: 0 }
++    }
++}
++
++impl<V, D> VmDisplayRegistry<V, D> {
++    fn next_generation(&mut self) -> Result<i64, Error> {
++        self.generation = self.generation.checked_add(1).ok_or(Error::GenerationExhausted)?;
++        Ok(self.generation)
++    }
++
++    fn owned(&self, cid: u32, uid: u32) -> Result<&Entry<V, D>, Error> {
++        self.entries.get(&cid).filter(|entry| entry.owner_uid == uid).ok_or(Error::AccessDenied)
++    }
++
++    fn owned_mut(&mut self, cid: u32, uid: u32) -> Result<&mut Entry<V, D>, Error> {
++        self.entries.get_mut(&cid).filter(|entry| entry.owner_uid == uid).ok_or(Error::AccessDenied)
++    }
++
++    pub(crate) fn contains_cid(&self, cid: u32) -> bool {
++        self.entries.contains_key(&cid)
++    }
++
++    pub(crate) fn running_vms(&self) -> impl Iterator<Item = (&u32, &V)> {
++        self.entries.iter().filter_map(|(cid, entry)| match &entry.vm {
++            VmSlot::Running(vm) => Some((cid, vm)),
++            _ => None,
++        })
++    }
++
++    pub(crate) fn allocate(&mut self, cid: u32, uid: u32) -> Result<(), Error> {
++        if self.contains_cid(cid) {
++            return Err(Error::AlreadyAllocated);
++        }
++        let generation = self.next_generation()?;
++        self.entries.insert(
++            cid,
++            Entry { owner_uid: uid, generation, vm: VmSlot::Allocated, display: None },
++        );
++        Ok(())
++    }
++
++    /// Rebuild a live VM's registration after the global service restarts.
++    /// Existing allocations must still match the kernel caller's full UID.
++    pub(crate) fn adopt(&mut self, cid: u32, uid: u32) -> Result<(), Error> {
++        if let Some(entry) = self.entries.get(&cid) {
++            if entry.owner_uid != uid {
++                Err(Error::AccessDenied)
++            } else if matches!(&entry.vm, VmSlot::Retired) {
++                Err(Error::AlreadyRunning)
++            } else {
++                Ok(())
++            }
++        } else {
++            self.allocate(cid, uid)
++        }
++    }
++
++    pub(crate) fn prepare_vm(&self, cid: u32, uid: u32) -> Result<i64, Error> {
++        let entry = self.owned(cid, uid)?;
++        if !matches!(&entry.vm, VmSlot::Allocated) {
++            return Err(Error::AlreadyRunning);
++        }
++        Ok(entry.generation)
++    }
++
++    pub(crate) fn register_vm(&mut self, cid: u32, uid: u32, vm: V) -> Result<(), Error> {
++        let entry = self.owned_mut(cid, uid)?;
++        if !matches!(&entry.vm, VmSlot::Allocated) {
++            return Err(Error::AlreadyRunning);
++        }
++        entry.vm = VmSlot::Running(vm);
++        Ok(())
++    }
++
++    pub(crate) fn unregister_vm(&mut self, cid: u32, uid: u32) -> Result<(), Error> {
++        self.owned(cid, uid)?;
++        self.entries.remove(&cid);
++        Ok(())
++    }
++
++    pub(crate) fn generation_matches(&self, cid: u32, generation: i64) -> bool {
++        self.entries.get(&cid).is_some_and(|entry| entry.generation == generation)
++    }
++
++    /// Binder death does not prove that crosvm exited. Drop handles, but keep the CID
++    /// unavailable until the owner confirms exit through unregister_vm or the service restarts.
++    pub(crate) fn retire_vm(&mut self, cid: u32, generation: i64) {
++        if let Some(entry) =
++            self.entries.get_mut(&cid).filter(|entry| entry.generation == generation)
++        {
++            entry.vm = VmSlot::Retired;
++            entry.display = None;
++        }
++    }
++
++    pub(crate) fn reserve_display(&mut self, cid: u32, uid: u32) -> Result<i64, Error> {
++        if !matches!(&self.owned(cid, uid)?.vm, VmSlot::Running(_)) {
++            return Err(Error::NotReady);
++        }
++        self.next_generation()
++    }
++
++    pub(crate) fn set_display(
++        &mut self,
++        cid: u32,
++        uid: u32,
++        generation: i64,
++        display: D,
++    ) -> Result<Option<D>, Error> {
++        let entry = self.owned_mut(cid, uid)?;
++        if !matches!(&entry.vm, VmSlot::Running(_)) {
++            return Err(Error::NotReady);
++        }
++        Ok(entry.display.replace((generation, display)).map(|(_, display)| display))
++    }
++
++    pub(crate) fn display(&self, cid: u32, uid: u32) -> Result<&D, Error> {
++        let entry = self.owned(cid, uid)?;
++        if !matches!(&entry.vm, VmSlot::Running(_)) {
++            return Err(Error::NotReady);
++        }
++        entry.display.as_ref().map(|(_, display)| display).ok_or(Error::NotReady)
++    }
++
++    pub(crate) fn clear_display(
++        &mut self,
++        cid: u32,
++        uid: u32,
++        generation: i64,
++    ) -> Result<Option<D>, Error> {
++        self.owned(cid, uid)?;
++        Ok(self.retire_display(cid, generation))
++    }
++
++    /// A late death notification must not clear a replacement display or reused CID.
++    pub(crate) fn retire_display(&mut self, cid: u32, generation: i64) -> Option<D> {
++        let entry = self.entries.get_mut(&cid)?;
++        if entry.display.as_ref().is_some_and(|(current, _)| *current == generation) {
++            entry.display.take().map(|(_, display)| display)
++        } else {
++            None
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::{Error, VmDisplayRegistry};
++
++    const OWNER: u32 = 10387;
++    const OTHER: u32 = 10388;
++    const WORK_PROFILE_OWNER: u32 = OWNER + 100000;
++    const CID: u32 = 2048;
++
++    fn running() -> VmDisplayRegistry<&'static str, &'static str> {
++        let mut registry = VmDisplayRegistry::default();
++        registry.allocate(CID, OWNER).unwrap();
++        registry.register_vm(CID, OWNER, "vm-a").unwrap();
++        registry
++    }
++
++    fn publish(
++        registry: &mut VmDisplayRegistry<&str, &str>,
++        cid: u32,
++        uid: u32,
++        name: &'static str,
++    ) -> i64 {
++        let generation = registry.reserve_display(cid, uid).unwrap();
++        registry.set_display(cid, uid, generation, name).unwrap();
++        generation
++    }
++
++    #[test]
++    fn simultaneous_vms_are_selected_by_cid_and_full_android_uid() {
++        let mut registry = running();
++        registry.allocate(CID + 1, OTHER).unwrap();
++        registry.register_vm(CID + 1, OTHER, "vm-b").unwrap();
++        publish(&mut registry, CID, OWNER, "display-a");
++        publish(&mut registry, CID + 1, OTHER, "display-b");
++        assert_eq!(registry.display(CID, OWNER), Ok(&"display-a"));
++        assert_eq!(registry.display(CID + 1, OTHER), Ok(&"display-b"));
++        for uid in [OTHER, WORK_PROFILE_OWNER, 0] {
++            assert_eq!(registry.display(CID, uid), Err(Error::AccessDenied));
++        }
++        assert_eq!(registry.display(CID + 1, OWNER), Err(Error::AccessDenied));
++        assert_eq!(registry.display(CID + 2, OWNER), Err(Error::AccessDenied));
++        assert_eq!(registry.running_vms().count(), 2);
++    }
++
++    #[test]
++    fn only_allocator_can_register_and_live_allocations_cannot_be_replaced() {
++        let mut registry = VmDisplayRegistry::<&str, &str>::default();
++        registry.allocate(CID, OWNER).unwrap();
++        assert!(registry.contains_cid(CID));
++        assert_eq!(registry.allocate(CID, OTHER), Err(Error::AlreadyAllocated));
++        assert_eq!(registry.prepare_vm(CID, OTHER), Err(Error::AccessDenied));
++        assert_eq!(registry.register_vm(CID, OTHER, "foreign"), Err(Error::AccessDenied));
++        assert_eq!(registry.reserve_display(CID, OWNER), Err(Error::NotReady));
++        assert_eq!(registry.set_display(CID, OWNER, 1, "premature"), Err(Error::NotReady));
++        registry.register_vm(CID, OWNER, "original").unwrap();
++        assert_eq!(registry.prepare_vm(CID, OWNER), Err(Error::AlreadyRunning));
++        assert_eq!(registry.register_vm(CID, OWNER, "replacement"), Err(Error::AlreadyRunning));
++        assert_eq!(registry.running_vms().collect::<Vec<_>>(), vec![(&CID, &"original")]);
++    }
++
++    #[test]
++    fn foreign_uid_cannot_publish_clear_or_unregister_an_owned_vm() {
++        let mut registry = running();
++        let display = publish(&mut registry, CID, OWNER, "original");
++        assert_eq!(registry.reserve_display(CID, OTHER), Err(Error::AccessDenied));
++        assert_eq!(registry.set_display(CID, OTHER, display, "foreign"), Err(Error::AccessDenied));
++        assert_eq!(registry.clear_display(CID, OTHER, display), Err(Error::AccessDenied));
++        assert_eq!(registry.unregister_vm(CID, OTHER), Err(Error::AccessDenied));
++        assert_eq!(registry.display(CID, OWNER), Ok(&"original"));
++    }
++
++    #[test]
++    fn failed_creation_can_cancel_its_unregistered_allocation() {
++        let mut registry = running();
++        registry.allocate(CID + 1, OWNER).unwrap();
++        registry.unregister_vm(CID + 1, OWNER).unwrap();
++        assert!(!registry.contains_cid(CID + 1));
++        registry.allocate(CID + 1, OTHER).unwrap();
++        assert_eq!(registry.prepare_vm(CID + 1, OWNER), Err(Error::AccessDenied));
++        assert_eq!(registry.running_vms().collect::<Vec<_>>(), vec![(&CID, &"vm-a")]);
++    }
++
++    #[test]
++    fn restarted_service_can_adopt_live_vms_but_not_overwrite_another_owner() {
++        let mut registry = VmDisplayRegistry::<&str, &str>::default();
++        registry.allocate(CID, OWNER).unwrap();
++        let generation = registry.prepare_vm(CID, OWNER).unwrap();
++        assert!(generation > 0);
++        registry.adopt(CID, OWNER).unwrap();
++        assert_eq!(registry.prepare_vm(CID, OWNER), Ok(generation));
++        registry.register_vm(CID, OWNER, "surviving-vm").unwrap();
++        registry.adopt(CID, OWNER).unwrap();
++        assert_eq!(registry.adopt(CID, OTHER), Err(Error::AccessDenied));
++        assert_eq!(registry.register_vm(CID, OTHER, "foreign-vm"), Err(Error::AccessDenied));
++        publish(&mut registry, CID, OWNER, "surviving-display");
++        assert_eq!(registry.display(CID, OWNER), Ok(&"surviving-display"));
++        assert_eq!(registry.running_vms().collect::<Vec<_>>(), vec![(&CID, &"surviving-vm")]);
++    }
++
++    #[test]
++    fn stale_display_death_and_clear_leave_replacement_attached() {
++        let mut registry = running();
++        let old = publish(&mut registry, CID, OWNER, "old");
++        let current = publish(&mut registry, CID, OWNER, "current");
++        assert_eq!(registry.retire_display(CID, old), None);
++        assert_eq!(registry.clear_display(CID, OWNER, old), Ok(None));
++        assert_eq!(registry.display(CID, OWNER), Ok(&"current"));
++        assert_eq!(registry.clear_display(CID, OWNER, current), Ok(Some("current")));
++        assert_eq!(registry.display(CID, OWNER), Err(Error::NotReady));
++    }
++
++    #[test]
++    fn cid_reuse_revokes_old_handles_and_ignores_old_death_notifications() {
++        let mut registry = VmDisplayRegistry::<&str, &str>::default();
++        registry.allocate(CID, OWNER).unwrap();
++        let old_vm = registry.prepare_vm(CID, OWNER).unwrap();
++        registry.register_vm(CID, OWNER, "old-vm").unwrap();
++        let old_display = publish(&mut registry, CID, OWNER, "old-display");
++        registry.unregister_vm(CID, OWNER).unwrap();
++        assert_eq!(registry.display(CID, OWNER), Err(Error::AccessDenied));
++        registry.adopt(CID, OTHER).unwrap();
++        let new_vm = registry.prepare_vm(CID, OTHER).unwrap();
++        assert!(new_vm > old_vm);
++        assert!(!registry.generation_matches(CID, old_vm));
++        assert!(registry.generation_matches(CID, new_vm));
++        registry.register_vm(CID, OTHER, "new-vm").unwrap();
++        publish(&mut registry, CID, OTHER, "new-display");
++        registry.retire_vm(CID, old_vm);
++        assert_eq!(registry.retire_display(CID, old_display), None);
++        assert_eq!(registry.display(CID, OTHER), Ok(&"new-display"));
++    }
++
++    #[test]
++    fn binder_death_reserves_cid_until_crosvm_exit_is_confirmed() {
++        let mut registry = VmDisplayRegistry::<&str, &str>::default();
++        registry.allocate(CID, OWNER).unwrap();
++        let generation = registry.prepare_vm(CID, OWNER).unwrap();
++        registry.register_vm(CID, OWNER, "lost-manager").unwrap();
++        let display_generation = publish(&mut registry, CID, OWNER, "display");
++        registry.retire_vm(CID, generation);
++        assert!(registry.contains_cid(CID));
++        assert_eq!(registry.allocate(CID, OTHER), Err(Error::AlreadyAllocated));
++        assert_eq!(registry.adopt(CID, OTHER), Err(Error::AccessDenied));
++        assert_eq!(registry.adopt(CID, OWNER), Err(Error::AlreadyRunning));
++        assert_eq!(registry.prepare_vm(CID, OWNER), Err(Error::AlreadyRunning));
++        assert_eq!(registry.register_vm(CID, OWNER, "replacement"), Err(Error::AlreadyRunning));
++        assert_eq!(registry.reserve_display(CID, OWNER), Err(Error::NotReady));
++        assert_eq!(
++            registry.set_display(CID, OWNER, display_generation, "replacement"),
++            Err(Error::NotReady)
++        );
++        assert_eq!(registry.display(CID, OWNER), Err(Error::NotReady));
++        assert_eq!(registry.running_vms().count(), 0);
++        registry.unregister_vm(CID, OWNER).unwrap();
++        registry.allocate(CID, OTHER).unwrap();
++    }
++
++    #[test]
++    fn generation_exhaustion_refuses_without_reusing_a_token() {
++        let mut registry = running();
++        publish(&mut registry, CID, OWNER, "existing");
++        registry.generation = i64::MAX;
++        assert_eq!(registry.reserve_display(CID, OWNER), Err(Error::GenerationExhausted));
++        assert_eq!(registry.allocate(CID + 1, OTHER), Err(Error::GenerationExhausted));
++        assert!(!registry.contains_cid(CID + 1));
++        assert_eq!(registry.display(CID, OWNER), Ok(&"existing"));
++    }
++}
+diff --git a/android/virtualizationservice/aidl/android/system/virtualizationservice/IVirtualMachineDisplayService.aidl b/android/virtualizationservice/aidl/android/system/virtualizationservice/IVirtualMachineDisplayService.aidl
+new file mode 100644
+index 000000000..3e8c0a7ee
+--- /dev/null
++++ b/android/virtualizationservice/aidl/android/system/virtualizationservice/IVirtualMachineDisplayService.aidl
+@@ -0,0 +1,19 @@
++/* Copyright 2026 The Android Open Source Project
++ * SPDX-License-Identifier: Apache-2.0
++ */
++package android.system.virtualizationservice;
++
++/** Kernel-Binder display broker. This is not the privileged internal VM service. */
++interface IVirtualMachineDisplayService {
++    const String SERVICE_NAME = "android.system.virtualizationdisplay";
++    const int ERROR_NOT_READY = 1;
++
++    /**
++     * Returns the display of the caller's registered VM, without waiting for another VM.
++     * Requires MANAGE_VIRTUAL_MACHINE and USE_CUSTOM_VIRTUAL_MACHINE. The owner is checked
++     * against the full kernel Binder calling UID captured when this CID was allocated.
++     * Throws SecurityException for an unknown/foreign CID, or ERROR_NOT_READY if unpublished.
++     * The returned service independently enforces the owner's UID on every transaction.
++     */
++    IBinder getDisplayService(int cid);
++}
+diff --git a/libs/android_display_backend/vm_display_access.h b/libs/android_display_backend/vm_display_access.h
+new file mode 100644
+index 000000000..5742ea7d0
+--- /dev/null
++++ b/libs/android_display_backend/vm_display_access.h
+@@ -0,0 +1,19 @@
++// Copyright 2026 The Android Open Source Project
++// SPDX-License-Identifier: Apache-2.0
++
++#pragma once
++
++#include <sys/types.h>
++
++// DisplayService serializes this state with its transaction/lifecycle mutex.
++class VmDisplayAccess {
++public:
++    explicit VmDisplayAccess(uid_t owner) : mOwner(owner) {}
++
++    bool permits(uid_t caller) const { return mActive && caller == mOwner; }
++    void revoke() { mActive = false; }
++
++private:
++    const uid_t mOwner;
++    bool mActive = true;
++};
+diff --git a/libs/android_display_backend/vm_display_access_test.cpp b/libs/android_display_backend/vm_display_access_test.cpp
+new file mode 100644
+index 000000000..89814df94
+--- /dev/null
++++ b/libs/android_display_backend/vm_display_access_test.cpp
+@@ -0,0 +1,25 @@
++// Copyright 2026 The Android Open Source Project
++// SPDX-License-Identifier: Apache-2.0
++
++#include "vm_display_access.h"
++
++#include <cstdio>
++
++int main() {
++    constexpr uid_t owner = 10387;
++    VmDisplayAccess original(owner);
++    VmDisplayAccess other(owner + 1);
++    if (!original.permits(owner) || original.permits(owner + 1) ||
++        original.permits(owner + 100000) || original.permits(0) || other.permits(owner)) {
++        std::fputs("FAIL: display handle crossed a UID or Android-user boundary\n", stderr);
++        return 1;
++    }
++    original.revoke();
++    VmDisplayAccess replacement(owner);
++    if (original.permits(owner) || original.permits(owner + 1) || !replacement.permits(owner)) {
++        std::fputs("FAIL: a retired display remained usable or revoked its replacement\n", stderr);
++        return 1;
++    }
++    std::puts("PASS: owner-only, full Android UID, transferred-handle refusal, independent revocation");
++    return 0;
++}
+diff --git a/android/virtualizationservice/fuzzer.cpp b/android/virtualizationservice/fuzzer.cpp
+new file mode 100644
+index 000000000..8c8620e40
+--- /dev/null
++++ b/android/virtualizationservice/fuzzer.cpp
+@@ -0,0 +1,33 @@
++/*
++ * Copyright 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#include <aidl/android/system/virtualizationservice/IVirtualMachineDisplayService.h>
++#include <android/binder_manager.h>
++#include <fuzzbinder/libbinder_ndk_driver.h>
++#include <fuzzer/FuzzedDataProvider.h>
++
++#include <cstdlib>
++
++using aidl::android::system::virtualizationservice::IVirtualMachineDisplayService;
++
++// Device-only: exercise the real broker on an OS containing this service.
++extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
++    static const ndk::SpAIBinder service{
++            AServiceManager_waitForService(IVirtualMachineDisplayService::SERVICE_NAME)};
++    if (service.get() == nullptr) std::abort();
++    android::fuzzService(service.get(), FuzzedDataProvider(data, size));
++    if (AIBinder_ping(service.get()) != STATUS_OK) std::abort();
++    return 0;
++}

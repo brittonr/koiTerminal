@@ -2249,6 +2249,8 @@ fn run_vm(config: CrosvmConfig, crosvm_control_socket_path: &Path) -> Result<Sha
 
     command.arg0(config.command.arg0);
     command.args(config.command.args);
+    // Native display registration must use this VM's allocated CID, not a global slot.
+    command.env("CROSVM_ANDROID_DISPLAY_CID", config.cid.to_string());
 
     // Keep track of what file descriptors should be mapped to the crosvm process.
     let mut preserved_fds = Vec::new();

@@ -20,8 +20,6 @@ import android.graphics.PixelFormat
 import android.os.DeadObjectException
 import android.os.ParcelFileDescriptor
 import android.os.RemoteException
-import android.os.ServiceManager
-import android.system.virtualizationservice_internal.IVirtualizationServiceInternal
 import android.util.Log
 import android.view.SurfaceControl
 import android.view.SurfaceHolder
@@ -41,14 +39,10 @@ internal class DisplayProvider(
     private val cursorView: SurfaceView,
     private val width: Int,
     private val height: Int,
+    private val displayService: ICrosvmAndroidDisplayService,
+    private val onError: (Exception) -> Unit,
 ) {
     private var cursorHandler: CursorHandler? = null
-    private val displayService: ICrosvmAndroidDisplayService by lazy {
-        val b = ServiceManager.waitForService("android.system.virtualizationservice")
-        val virtService = IVirtualizationServiceInternal.Stub.asInterface(b)
-        val b2 = virtService.waitDisplayService()
-        ICrosvmAndroidDisplayService.Stub.asInterface(b2)
-    }
 
     init {
         mainView.setSurfaceLifecycle(SurfaceView.SURFACE_LIFECYCLE_FOLLOWS_ATTACHMENT)
@@ -77,10 +71,8 @@ internal class DisplayProvider(
             try {
                 displayService.setSurface(holder.getSurface(), isForCursor())
             } catch (e: Exception) {
-                // TODO: don't consume this exception silently. For some unknown reason, setSurface
-                // call above throws IllegalArgumentException and that fails the surface
-                // configuration.
-                Log.e(TAG, "Failed to present surface $surfaceKind to VM", e)
+                onError(RuntimeException("Failed to present surface $surfaceKind to VM", e))
+                return
             }
             try {
                 if (surfaceKind == SurfaceKind.CURSOR) {
@@ -88,8 +80,7 @@ internal class DisplayProvider(
                     displayService.setCursorStream(stream)
                 }
             } catch (e: Exception) {
-                // TODO: don't consume exceptions here too
-                Log.e(TAG, "Failed to configure surface $surfaceKind", e)
+                onError(RuntimeException("Failed to configure surface $surfaceKind", e))
             }
         }
 
@@ -103,8 +94,10 @@ internal class DisplayProvider(
                 displayService.removeSurface(isForCursor())
             } catch (e: DeadObjectException) {
                 Log.w(TAG, "The display service is already dead", e)
+            } catch (e: SecurityException) {
+                onError(RuntimeException("The VM display was revoked", e))
             } catch (e: RemoteException) {
-                throw RuntimeException("Error while destroying surface for $surfaceKind", e)
+                onError(RuntimeException("Error while destroying surface for $surfaceKind", e))
             }
         }
     }

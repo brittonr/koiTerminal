@@ -19,6 +19,7 @@ mod atom;
 mod maintenance;
 mod remote_provisioning;
 mod rkpvm;
+mod vm_display;
 
 use crate::aidl::{
     is_remote_provisioning_hal_declared, remove_temporary_dir, VirtualizationServiceInternal,
@@ -26,6 +27,9 @@ use crate::aidl::{
 };
 use android_logger::{Config, FilterBuilder};
 use android_system_virtualizationmaintenance::aidl::android::system::virtualizationmaintenance;
+use android_system_virtualizationservice::aidl::android::system::virtualizationservice::IVirtualMachineDisplayService::{
+    BnVirtualMachineDisplayService, SERVICE_NAME as DISPLAY_SERVICE_NAME,
+};
 use android_system_virtualizationservice_internal::aidl::android::system::virtualizationservice_internal;
 use anyhow::{bail, Context, Error, Result};
 use binder::{register_lazy_service, BinderFeatures, ProcessState, ThreadState};
@@ -83,6 +87,10 @@ fn try_main() -> Result<()> {
     let internal_service =
         BnVirtualizationServiceInternal::new_binder(service.clone(), BinderFeatures::default());
     register(INTERNAL_SERVICE_NAME, internal_service)?;
+
+    let display_service =
+        BnVirtualMachineDisplayService::new_binder(service.clone(), BinderFeatures::default());
+    register(DISPLAY_SERVICE_NAME, display_service)?;
 
     if is_remote_provisioning_hal_declared().unwrap_or(false) {
         // The IRemotelyProvisionedComponent service is only supposed to be triggered by rkpd for

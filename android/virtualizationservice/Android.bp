@@ -94,6 +94,24 @@ rust_test {
     ],
 }
 
+rust_test_host {
+    name: "virtualization_display_registry_test",
+    srcs: ["src/vm_display.rs"],
+    edition: "2021",
+    test_suites: ["general-tests"],
+}
+
+cc_fuzz {
+    name: "virtualizationdisplay_fuzzer",
+    defaults: ["service_fuzzer_defaults"],
+    srcs: ["fuzzer.cpp"],
+    static_libs: ["android.system.virtualizationservice-ndk"],
+    shared_libs: [
+        "libbinder_ndk",
+        "liblog",
+    ],
+}
+
 // The chain originates from a CTS test for Keymint, with the Keymint certificate
 // (leaf certificate) truncated.
 //

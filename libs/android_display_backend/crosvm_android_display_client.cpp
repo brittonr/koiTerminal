@@ -16,16 +16,21 @@
 
 #include <aidl/android/crosvm/BnCrosvmAndroidDisplayService.h>
 #include <aidl/android/system/virtualizationservice_internal/IVirtualizationServiceInternal.h>
+#include <android-base/parseint.h>
 #include <android-base/result.h>
+#include <android/binder_ibinder.h>
 #include <android/binder_manager.h>
 #include <android/binder_process.h>
 #include <system/graphics.h> // for HAL_PIXEL_FORMAT_*
+#include <unistd.h>
 
 #include <condition_variable>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 
 #include "surface_control_dl.h"
+#include "vm_display_access.h"
 
 using aidl::android::crosvm::BnCrosvmAndroidDisplayService;
 using aidl::android::system::virtualizationservice_internal::IVirtualizationServiceInternal;
@@ -82,17 +87,15 @@ class AndroidDisplaySurface {
 public:
     AndroidDisplaySurface(const std::string& name) : mName(name) {}
 
-    Result<void> setNativeSurface(Surface* surface) {
+    Result<void> setNativeSurface(const Surface& surface) {
         {
             std::lock_guard lk(mSurfaceMutex);
-            mNativeSurface = std::make_unique<Surface>(surface->release());
-            mNativeSurfaceNeedsConfiguring = true;
-            Surface* surface = mNativeSurface.get();
-            if (!surface) {
-                return Error() << "Failed to get Surface";
+            ANativeWindow* anw = surface.get();
+            if (anw == nullptr) {
+                return Error() << "Failed to get native window";
             }
-
-            ANativeWindow* anw = surface->get();
+            mNativeSurface = std::make_unique<Surface>(anw);
+            mNativeSurfaceNeedsConfiguring = true;
             auto& sc = SurfaceControl::GetInstance();
             if (sc.IsSupported()) {
                 mSurfaceControl = sc.ASurfaceControl_createFromWindow(anw, mName.c_str());
@@ -315,26 +318,42 @@ private:
 
 class DisplayService : public BnCrosvmAndroidDisplayService {
 public:
-    DisplayService() = default;
+    DisplayService() : mAccess(getuid()) {}
     virtual ~DisplayService() = default;
 
-    ndk::ScopedAStatus setSurface(Surface* surface, bool forCursor) override {
-        getSurface(forCursor).setNativeSurface(surface);
+    void deactivate() {
+        std::lock_guard lock(mLifecycleMutex);
+        mAccess.revoke();
+    }
+
+    ndk::ScopedAStatus setSurface(const Surface& surface, bool forCursor) override {
+        std::lock_guard lock(mLifecycleMutex);
+        if (auto status = checkCallerLocked(); !status.isOk()) return status;
+        if (auto ret = getSurface(forCursor).setNativeSurface(surface); !ret.ok()) {
+            return ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
+                    -1, ret.error().message().c_str());
+        }
         return ::ndk::ScopedAStatus::ok();
     }
 
     ndk::ScopedAStatus removeSurface(bool forCursor) override {
+        std::lock_guard lock(mLifecycleMutex);
+        if (auto status = checkCallerLocked(); !status.isOk()) return status;
         getSurface(forCursor).removeSurface();
         return ::ndk::ScopedAStatus::ok();
     }
 
     ndk::ScopedFileDescriptor& getCursorStream() { return mCursorStream; }
-    ndk::ScopedAStatus setCursorStream(const ndk::ScopedFileDescriptor& in_stream) {
+    ndk::ScopedAStatus setCursorStream(const ndk::ScopedFileDescriptor& in_stream) override {
+        std::lock_guard lock(mLifecycleMutex);
+        if (auto status = checkCallerLocked(); !status.isOk()) return status;
         mCursorStream = ndk::ScopedFileDescriptor(dup(in_stream.get()));
         return ::ndk::ScopedAStatus::ok();
     }
 
     ndk::ScopedAStatus saveFrameForSurface(bool forCursor) override {
+        std::lock_guard lock(mLifecycleMutex);
+        if (auto status = checkCallerLocked(); !status.isOk()) return status;
         if (auto ret = getSurface(forCursor).saveFrame(); !ret.ok()) {
             std::string msg = std::format("Failed to save frame: {}", ret.error().message());
             return ::ndk::ScopedAStatus(
@@ -344,6 +363,8 @@ public:
     }
 
     ndk::ScopedAStatus drawSavedFrameForSurface(bool forCursor) override {
+        std::lock_guard lock(mLifecycleMutex);
+        if (auto status = checkCallerLocked(); !status.isOk()) return status;
         if (auto ret = getSurface(forCursor).drawSavedFrame(); !ret.ok()) {
             std::string msg = std::format("Failed to draw saved frame: {}", ret.error().message());
             return ::ndk::ScopedAStatus(
@@ -361,6 +382,16 @@ public:
     }
 
 private:
+    ndk::ScopedAStatus checkCallerLocked() const {
+        if (!mAccess.permits(AIBinder_getCallingUid())) {
+            return ndk::ScopedAStatus::fromExceptionCodeWithMessage(
+                    EX_SECURITY, "VM display is not available to this caller");
+        }
+        return ndk::ScopedAStatus::ok();
+    }
+
+    std::mutex mLifecycleMutex;
+    VmDisplayAccess mAccess;
     AndroidDisplaySurface mScanout{"scanout"};
     AndroidDisplaySurface mCursor{"cursor"};
     ndk::ScopedFileDescriptor mCursorStream;
@@ -373,9 +404,16 @@ typedef void (*ErrorCallback)(const char* message);
 struct AndroidDisplayContext {
     std::shared_ptr<IVirtualizationServiceInternal> virt_service;
     std::shared_ptr<DisplayService> disp_service;
+    int32_t cid = 0;
+    int64_t display_generation = 0;
     ErrorCallback error_callback;
 
     AndroidDisplayContext(ErrorCallback cb) : error_callback(cb) {
+        const char* cid_env = std::getenv("CROSVM_ANDROID_DISPLAY_CID");
+        if (cid_env == nullptr || !android::base::ParseInt(cid_env, &cid, 3)) {
+            errorf("Missing or invalid VM display CID");
+            return;
+        }
         auto disp_service = ::ndk::SharedRefBase::make<DisplayService>();
 
         // Creates DisplayService and register it to the virtualizationservice. This is needed
@@ -387,7 +425,8 @@ struct AndroidDisplayContext {
             errorf("Failed to find virtualization service");
             return;
         }
-        auto status = virt_service->setDisplayService(disp_service->asBinder());
+        auto status = virt_service->setDisplayService(cid, disp_service->asBinder(),
+                                                     &display_generation);
         if (!status.isOk()) {
             errorf("Failed to register display service");
             return;
@@ -399,11 +438,13 @@ struct AndroidDisplayContext {
     }
 
     ~AndroidDisplayContext() {
+        if (disp_service != nullptr) {
+            disp_service->deactivate();
+        }
         if (virt_service == nullptr) {
-            errorf("Not connected to virtualization service");
             return;
         }
-        auto status = this->virt_service->clearDisplayService();
+        auto status = virt_service->clearDisplayService(cid, display_generation);
         if (!status.isOk()) {
             errorf("Failed to clear display service");
         }

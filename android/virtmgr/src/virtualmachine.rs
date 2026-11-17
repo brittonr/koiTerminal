@@ -604,6 +604,16 @@ impl VirtualizationService {
         } else {
             self.create_vm_context()?
         };
+        // A failed creation has no VM death recipient or exit monitor to release its CID.
+        let allocation_guard = scopeguard::guard(cid, |cid| {
+            if !cfg!(early) {
+                if let Err(error) =
+                    global_service().unwrap().unregisterVirtualMachine(cid.try_into().unwrap())
+                {
+                    warn!("Failed to release uncreated VM ({cid}): {error:?}");
+                }
+            }
+        });
 
         if is_custom_config(config) {
             check_use_custom_virtual_machine()?;
@@ -776,6 +786,7 @@ impl VirtualizationService {
         register_to_global_service(&vm)
             .context(format!("Failed to register VM ({cid}) to the global service"))
             .or_service_specific_exception(-1)?;
+        let _ = scopeguard::ScopeGuard::into_inner(allocation_guard);
 
         Ok(vm)
     }

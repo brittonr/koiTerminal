@@ -43,6 +43,7 @@ import static android.system.virtualmachine.VirtualMachineCallback.STOP_REASON_V
 import static java.util.Objects.requireNonNull;
 
 import android.annotation.CallbackExecutor;
+import android.annotation.FlaggedApi;
 import android.annotation.IntDef;
 import android.annotation.IntRange;
 import android.annotation.NonNull;
@@ -62,6 +63,7 @@ import android.os.Build;
 import android.os.IBinder;
 import android.os.ParcelFileDescriptor;
 import android.os.RemoteException;
+import android.os.ServiceManager;
 import android.os.ServiceSpecificException;
 import android.system.ErrnoException;
 import android.system.OsConstants;
@@ -70,6 +72,7 @@ import android.system.virtualizationcommon.ErrorCode;
 import android.system.virtualizationcommon.IEncryptedStoreKEK;
 import android.system.virtualizationservice.IVirtualMachine;
 import android.system.virtualizationservice.IVirtualMachineCallback;
+import android.system.virtualizationservice.IVirtualMachineDisplayService;
 import android.system.virtualizationservice.IVirtualizationService;
 import android.system.virtualizationservice.InputDevice;
 import android.system.virtualizationservice.PartitionType;
@@ -82,6 +85,7 @@ import android.util.Pair;
 import android.view.MotionEvent;
 
 import com.android.internal.annotations.GuardedBy;
+import com.android.system.virtualmachine.flags.Flags;
 
 import libcore.io.IoBridge;
 import libcore.io.IoUtils;
@@ -2255,6 +2259,40 @@ public class VirtualMachine implements AutoCloseable {
             } catch (RemoteException e) {
                 throw e.rethrowAsRuntimeException();
             } catch (ServiceSpecificException e) {
+                throw new VirtualMachineException(e);
+            }
+        }
+    }
+
+    /**
+     * Obtains the native display handle for this running VM.
+     *
+     * <p>The display uses kernel Binder: native Surface producers cannot be forwarded through
+     * the virtmgr Binder-RPC connection. The broker authenticates the full calling UID; the
+     * returned display also checks that UID on every call. This never waits for a global display.
+     *
+     * @throws VirtualMachineException if the VM/display is unavailable
+     * @hide
+     */
+    @SystemApi
+    @FlaggedApi(Flags.FLAG_TERMINAL_GUI_SUPPORT)
+    @WorkerThread
+    @NonNull
+    @RequiresPermission(
+            allOf = {MANAGE_VIRTUAL_MACHINE_PERMISSION, USE_CUSTOM_VIRTUAL_MACHINE_PERMISSION})
+    public IBinder getDisplayService() throws VirtualMachineException {
+        synchronized (mLock) {
+            getRunningVm();
+            IBinder broker = ServiceManager.checkService(IVirtualMachineDisplayService.SERVICE_NAME);
+            if (broker == null) {
+                throw new VirtualMachineException("This OS has no VM-owned display broker");
+            }
+            try {
+                IBinder display =
+                        IVirtualMachineDisplayService.Stub.asInterface(broker).getDisplayService(mCid);
+                Binder.allowBlocking(display);
+                return display;
+            } catch (RemoteException | ServiceSpecificException | SecurityException e) {
                 throw new VirtualMachineException(e);
             }
         }

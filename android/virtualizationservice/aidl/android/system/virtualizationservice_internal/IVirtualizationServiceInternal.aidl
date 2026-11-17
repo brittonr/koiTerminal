@@ -135,10 +135,10 @@ interface IVirtualizationServiceInternal {
      */
     void claimVmInstance(in byte[64] instanceId);
 
-    // TODO(b/330257000): Remove these functions when a display service is running with binder RPC.
-    void setDisplayService(IBinder ibinder);
-    void clearDisplayService();
-    IBinder waitDisplayService();
+    /** Registers a display for the caller's allocated/registered VM; returns its generation. */
+    long setDisplayService(int cid, IBinder ibinder);
+    /** Clears only this registration, never a later display that reused the CID. */
+    void clearDisplayService(int cid, long generation);
 
     /**
      * Create TAP network interface for a VM.

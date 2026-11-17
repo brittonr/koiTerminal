@@ -11,8 +11,6 @@ android_app {
     asset_dirs: ["assets"],
     resource_dirs: ["res"],
     static_libs: [
-        // TODO(b/330257000): will be removed when binder RPC is used
-        "android.system.virtualizationservice_internal-java",
         "androidx-constraintlayout_constraintlayout",
         "androidx.navigation_navigation-fragment-ktx",
         "androidx.window_window",

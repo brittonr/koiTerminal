@@ -15,12 +15,15 @@
  */
 package com.android.virtualization.koiterminal
 
+import android.app.AlertDialog
 import android.app.PictureInPictureParams
 import android.content.pm.ActivityInfo
+import android.crosvm.ICrosvmAndroidDisplayService
 import android.graphics.Rect
 import android.os.Bundle
 import android.system.virtualmachine.VirtualMachine
 import android.system.virtualmachine.VirtualMachineManager
+import android.util.Log
 import android.view.LayoutInflater
 import android.view.MotionEvent
 import android.view.SurfaceView
@@ -36,7 +39,10 @@ import androidx.constraintlayout.widget.ConstraintLayout
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.isVisible
+import com.android.virtualization.koiterminal.MainActivity.Companion.TAG
 import com.google.android.material.button.MaterialButton
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 
 class DisplayActivity : BaseActivity() {
     private lateinit var mainView: DisplaySurfaceView
@@ -49,29 +55,75 @@ class DisplayActivity : BaseActivity() {
     private lateinit var mouseLockButton: MaterialButton
     private lateinit var displayFlow: androidx.constraintlayout.helper.widget.Flow
     private lateinit var displayProvider: DisplayProvider
+    private lateinit var displayExecutor: ExecutorService
+    private var displayFailureDialog: AlertDialog? = null
     private lateinit var pictureInPictureParams: PictureInPictureParams
     private var hasPointerCapture = false
     private var debianVm: VirtualMachine? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_display)
-        initializeViews()
-        val vmm = applicationContext.getSystemService(VirtualMachineManager::class.java)
-        debianVm = vmm?.get("debian")
-        // TODO: Add error handling if vmm is missing
-        debianVm?.let { vm ->
-            setupDisplayAndInput(vm)
-            setupUI()
+        displayExecutor =
+            Executors.newSingleThreadExecutor(TerminalThreadFactory(applicationContext))
+        displayExecutor.execute {
+            try {
+                val vmm = applicationContext.getSystemService(VirtualMachineManager::class.java)
+                val vm = checkNotNull(vmm?.get("debian")) { "No Linux VM is available for display" }
+                val config = checkNotNull(vm.config.customImageConfig?.displayConfig) {
+                    "The Linux VM has no display configuration"
+                }
+                val display = ICrosvmAndroidDisplayService.Stub.asInterface(vm.getDisplayService())
+                runOnUiThread {
+                    if (!isFinishing && !isDestroyed) {
+                        debianVm = vm
+                        // Inflate after acquisition so Surface callbacks cannot precede the handle.
+                        setContentView(R.layout.activity_display)
+                        initializeViews()
+                        setupDisplayAndInput(vm, display, config.width, config.height)
+                        setupUI()
+                    }
+                }
+            } catch (error: Exception) {
+                runOnUiThread { failDisplay(error) }
+            } catch (error: NoSuchMethodError) {
+                runOnUiThread {
+                    failDisplay(
+                        UnsupportedOperationException("This OS needs the VM-owned display update", error)
+                    )
+                }
+            }
         }
     }
 
-    private fun setupDisplayAndInput(vm: VirtualMachine) {
+    override fun onDestroy() {
+        displayExecutor.shutdownNow()
+        displayFailureDialog?.dismiss()
+        super.onDestroy()
+    }
+
+    private fun failDisplay(error: Exception) {
+        if (!isFinishing && !isDestroyed && displayFailureDialog == null) {
+            Log.e(TAG, "VM display unavailable", error)
+            // Do not launch the task-clearing ErrorActivity or terminate the VM-owning process.
+            displayFailureDialog =
+                AlertDialog.Builder(this)
+                    .setTitle(android.R.string.dialog_alert_title)
+                    .setMessage(error.message ?: error.toString())
+                    .setPositiveButton(android.R.string.ok) { _, _ -> finish() }
+                    .setOnCancelListener { finish() }
+                    .show()
+        }
+    }
+
+    private fun setupDisplayAndInput(
+        vm: VirtualMachine,
+        display: ICrosvmAndroidDisplayService,
+        width: Int,
+        height: Int,
+    ) {
         // Connect the views to the VM
-        val width = vm.config.customImageConfig?.displayConfig!!.width
-        val height = vm.config.customImageConfig?.displayConfig!!.height
         val ratio = android.util.Rational(width, height)
-        displayProvider = DisplayProvider(mainView, cursorView, width, height)
+        displayProvider = DisplayProvider(mainView, cursorView, width, height, display, ::failDisplay)
         InputForwarder(this, vm, mainView, mainView, mainView)
         // Calculate the screen ratio of the VM
         (mainView.layoutParams as ConstraintLayout.LayoutParams).dimensionRatio =
